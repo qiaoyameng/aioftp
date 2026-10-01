@@ -3,6 +3,7 @@ import asyncio
 import enum
 import errno
 import functools
+import ipaddress
 import logging
 import os
 import socket
@@ -12,7 +13,7 @@ import sys
 import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, TypedDict, TypeVar
+from typing import Any, Literal, TypedDict, TypeVar, cast
 
 from . import errors, pathio
 from .common import (
@@ -381,6 +382,10 @@ class ConnectionConditions:
     passive_server_started = (
         "passive_server",
         "no listen socket created (use PASV firstly)",
+    )
+    data_connection_configured = (
+        "data_endpoint",
+        "no data connection endpoint created (use PASV, EPSV, PORT, or EPRT firstly)",
     )
     data_connection_made = ("data_connection", "no data connection made")
     rename_from_required = ("rename_from", "no filename (use RNFR firstly)")
@@ -756,6 +761,8 @@ class Server:
             "pass": self.pass_,
             "pasv": self.pasv,
             "pbsz": self.pbsz,
+            "port": self.port,
+            "eprt": self.eprt,
             "prot": self.prot,
             "pwd": self.pwd,
             "quit": self.quit,
@@ -1240,21 +1247,16 @@ class Server:
 
     @ConnectionConditions(
         ConnectionConditions.login_required,
-        ConnectionConditions.passive_server_started,
+        ConnectionConditions.data_connection_configured,
     )
     @PathConditions(PathConditions.path_must_exists)
     @PathPermissions(PathPermissions.readable)
     async def mlsd(self, connection: Connection, rest: str | PurePosixPath) -> bool:
-        @ConnectionConditions(
-            ConnectionConditions.data_connection_made,
-            wait=True,
-            fail_code="425",
-            fail_info="Can't open data connection",
-        )
         @worker
         async def mlsd_worker(self: "Server", connection: Connection, rest: str | PurePosixPath) -> bool:
-            stream = connection.data_connection
-            del connection.data_connection
+            stream = await self._get_data_connection(connection)
+            if stream is None:
+                return True
             async with stream:
                 async for path in connection.path_io.list(real_path):
                     s = await self.build_mlsx_string(connection, path)
@@ -1299,21 +1301,16 @@ class Server:
 
     @ConnectionConditions(
         ConnectionConditions.login_required,
-        ConnectionConditions.passive_server_started,
+        ConnectionConditions.data_connection_configured,
     )
     @PathConditions(PathConditions.path_must_exists)
     @PathPermissions(PathPermissions.readable)
     async def list(self, connection: Connection, rest: str | PurePosixPath) -> bool:
-        @ConnectionConditions(
-            ConnectionConditions.data_connection_made,
-            wait=True,
-            fail_code="425",
-            fail_info="Can't open data connection",
-        )
         @worker
         async def list_worker(self: "Server", connection: Connection, rest: str | PurePosixPath) -> bool:
-            stream = connection.data_connection
-            del connection.data_connection
+            stream = await self._get_data_connection(connection)
+            if stream is None:
+                return True
             async with stream:
                 async for path in connection.path_io.list(real_path):
                     if not (await connection.path_io.exists(path)):
@@ -1378,20 +1375,15 @@ class Server:
 
     @ConnectionConditions(
         ConnectionConditions.login_required,
-        ConnectionConditions.passive_server_started,
+        ConnectionConditions.data_connection_configured,
     )
     @PathPermissions(PathPermissions.writable)
     async def stor(self, connection: Connection, rest: str | PurePosixPath, mode: str = "wb") -> bool:
-        @ConnectionConditions(
-            ConnectionConditions.data_connection_made,
-            wait=True,
-            fail_code="425",
-            fail_info="Can't open data connection",
-        )
         @worker
         async def stor_worker(self: "Server", connection: Connection, rest: str | PurePosixPath) -> bool:
-            stream = connection.data_connection
-            del connection.data_connection
+            stream = await self._get_data_connection(connection)
+            if stream is None:
+                return True
             if connection.restart_offset:
                 file_mode = "r+b"
             else:
@@ -1418,7 +1410,7 @@ class Server:
 
     @ConnectionConditions(
         ConnectionConditions.login_required,
-        ConnectionConditions.passive_server_started,
+        ConnectionConditions.data_connection_configured,
     )
     @PathConditions(
         PathConditions.path_must_exists,
@@ -1426,16 +1418,11 @@ class Server:
     )
     @PathPermissions(PathPermissions.readable)
     async def retr(self, connection: Connection, rest: str | PurePosixPath) -> bool:
-        @ConnectionConditions(
-            ConnectionConditions.data_connection_made,
-            wait=True,
-            fail_code="425",
-            fail_info="Can't open data connection",
-        )
         @worker
         async def retr_worker(self: "Server", connection: Connection, rest: str | PurePosixPath) -> bool:
-            stream = connection.data_connection
-            del connection.data_connection
+            stream = await self._get_data_connection(connection)
+            if stream is None:
+                return True
             file_in = connection.path_io.open(real_path, mode="rb")
             async with file_in, stream:
                 if connection.restart_offset:
@@ -1514,6 +1501,129 @@ class Server:
             )
         return passive_server
 
+    async def _cancel_transfer_workers(self, connection: Connection) -> None:
+        workers = set(connection.extra_workers)
+        if not workers:
+            return
+        for worker in workers:
+            worker.cancel()
+        await asyncio.wait(workers)
+
+    async def _close_passive_server(self, connection: Connection) -> None:
+        if not connection.future.passive_server.done():
+            return
+        connection.passive_server.close()
+        if self.available_data_ports is not None:
+            port = connection.passive_server_port
+            self.available_data_ports.put_nowait((0, port))
+        del connection.passive_server
+
+    @staticmethod
+    def _canonical_ip_address(
+        address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    ) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+            return address.ipv4_mapped
+        return address
+
+    def _validate_active_endpoint(
+        self,
+        connection: Connection,
+        address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+        port: int,
+    ) -> None:
+        peer = ipaddress.ip_address(connection.client_host)
+        if self._canonical_ip_address(address) != self._canonical_ip_address(peer):
+            raise ValueError("Active data address must match control connection peer")
+        if port < 1024 or port > 65535 or port == connection.server_port:
+            raise ValueError("Active data port is unsafe")
+
+    async def _clear_data_endpoint(self, connection: Connection) -> None:
+        if connection.future.data_endpoint.done():
+            del connection.data_endpoint
+
+    async def _open_active_data_connection(
+        self,
+        connection: Connection,
+        host: str,
+        port: int,
+    ) -> ThrottleStreamIO:
+        reader, writer = await asyncio.open_connection(host, port)
+        return ThrottleStreamIO(
+            reader,
+            writer,
+            throttles=connection.command_connection.throttles,
+            timeout=connection.socket_timeout,
+        )
+
+    async def _get_data_connection(self, connection: Connection) -> ThrottleStreamIO | None:
+        if connection.future.data_connection.done():
+            stream = cast(ThrottleStreamIO, connection.data_connection)
+            del connection.data_connection
+            return stream
+
+        if connection.future.passive_server.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(connection.future.data_connection),
+                    connection.wait_future_timeout,
+                )
+            except asyncio.TimeoutError:
+                connection.response("425", "Can't open data connection")
+                return None
+            return cast(ThrottleStreamIO, connection.data_connection)
+
+        host, port = connection.data_endpoint
+        host = cast(ipaddress.IPv4Address | ipaddress.IPv6Address, host)
+        port = cast(int, port)
+        try:
+            stream = await asyncio.wait_for(
+                self._open_active_data_connection(connection, str(host), port),
+                connection.wait_future_timeout,
+            )
+        except asyncio.TimeoutError:
+            connection.response("425", "Can't open data connection")
+            await self._clear_data_endpoint(connection)
+            return None
+        except OSError:
+            connection.response("425", "Can't open data connection")
+            await self._clear_data_endpoint(connection)
+            return None
+        except asyncio.CancelledError:
+            await self._clear_data_endpoint(connection)
+            raise
+        else:
+            connection.data_connection = stream
+            await self._clear_data_endpoint(connection)
+            return stream
+
+    @staticmethod
+    def parse_port_command(rest: str) -> tuple[ipaddress.IPv4Address, int]:
+        values = tuple(map(int, rest.split(",")))
+        if len(values) != 6 or any(value < 0 or value > 255 for value in values):
+            raise ValueError("Malformed PORT command")
+        address = ipaddress.IPv4Address(".".join(map(str, values[:4])))
+        port = (values[4] << 8) | values[5]
+        return address, port
+
+    @staticmethod
+    def parse_eprt_command(rest: str) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]:
+        if not rest or rest[0] != "|":
+            raise ValueError("Malformed EPRT command")
+        parts = rest.split(rest[0])
+        if len(parts) != 5 or parts[0] or parts[4]:
+            raise ValueError("Malformed EPRT command")
+        _, protocol, address_text, port_text, _ = parts
+        address: ipaddress.IPv4Address | ipaddress.IPv6Address
+        if protocol == "1":
+            address = ipaddress.IPv4Address(address_text)
+        elif protocol == "2":
+            address = ipaddress.IPv6Address(address_text)
+        else:
+            raise ValueError("Unsupported EPRT network protocol")
+        port = int(port_text)
+        return address, port
+
     @ConnectionConditions(ConnectionConditions.login_required)
     async def pasv(self, connection: Connection, rest: str | PurePosixPath) -> bool:
         async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -1526,6 +1636,18 @@ class Server:
                     throttles=connection.command_connection.throttles,
                     timeout=connection.socket_timeout,
                 )
+
+        await self._cancel_transfer_workers(connection)
+        await self._clear_data_endpoint(connection)
+        if connection.future.data_connection.done():
+            connection.data_connection.close()
+            del connection.data_connection
+
+        if connection.future.passive_server.done():
+            is_ipv4 = any(sock.family == socket.AF_INET for sock in connection.passive_server.sockets)
+            if not is_ipv4:
+                connection.response("503", ["this server started in ipv6 mode"])
+                return True
 
         if not connection.future.passive_server.done():
             coro = self._start_passive_server(connection, handler)
@@ -1548,8 +1670,9 @@ class Server:
                     host = self.ipv4_pasv_forced_response_address
                 break
         else:
+            await self._close_passive_server(connection)
             connection.response("503", ["this server started in ipv6 mode"])
-            return False
+            return True
 
         nums = tuple(map(int, host.split("."))) + (port >> 8, port & 0xFF)
         info = [info_template.format(address=f"({','.join(map(str, nums))})")]
@@ -1576,6 +1699,11 @@ class Server:
             code, info = "522", ["custom protocols support not implemented"]
             connection.response(code, info)
             return False
+        await self._cancel_transfer_workers(connection)
+        await self._clear_data_endpoint(connection)
+        if connection.future.data_connection.done():
+            connection.data_connection.close()
+            del connection.data_connection
         if not connection.future.passive_server.done():
             coro = self._start_passive_server(connection, handler)
             try:
@@ -1597,6 +1725,40 @@ class Server:
             connection.data_connection.close()
             del connection.data_connection
         connection.response(code, info)
+        return True
+
+    @ConnectionConditions(ConnectionConditions.login_required)
+    async def port(self, connection: Connection, rest: str | PurePosixPath) -> bool:
+        await self._cancel_transfer_workers(connection)
+        await self._close_passive_server(connection)
+        if connection.future.data_connection.done():
+            connection.data_connection.close()
+            del connection.data_connection
+        try:
+            address, port = self.parse_port_command(str(rest).strip())
+            self._validate_active_endpoint(connection, address, port)
+        except ValueError as exc:
+            connection.response("501", str(exc))
+            return True
+        connection.data_endpoint = address, port
+        connection.response("200", "active data connection address accepted")
+        return True
+
+    @ConnectionConditions(ConnectionConditions.login_required)
+    async def eprt(self, connection: Connection, rest: str | PurePosixPath) -> bool:
+        await self._cancel_transfer_workers(connection)
+        await self._close_passive_server(connection)
+        if connection.future.data_connection.done():
+            connection.data_connection.close()
+            del connection.data_connection
+        try:
+            address, port = self.parse_eprt_command(str(rest).strip())
+            self._validate_active_endpoint(connection, address, port)
+        except ValueError as exc:
+            connection.response("501", str(exc))
+            return True
+        connection.data_endpoint = address, port
+        connection.response("200", "active data connection address accepted")
         return True
 
     @ConnectionConditions(ConnectionConditions.login_required)

@@ -41,12 +41,12 @@ retrieve some data via extra connection. And the size of data is equal to «x».
                     collected.append(i)
             return collected
 
-Client retrieve passive (or active in future versions) via `get_stream` and
-read blocks of data until connection is closed. Then finishing stream and
-return result. Most of client functions (except low-level from BaseClient)
-are made in pretty same manner. It is a good idea you to see source code of
-:py:class:`aioftp.Client` in client.py to see when and why this or that
-techniques used.
+Client retrieves passive or active data connections via `get_stream` and
+reads blocks of data until the connection is closed. Finishing the stream
+consumes the final transfer response. Most client functions (except the
+low-level BaseClient helpers) follow the same pattern. See
+:py:class:`aioftp.Client` for passive_commands, active_commands, and
+data_connection_mode.
 
 Server
 ------
