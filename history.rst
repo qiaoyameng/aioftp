@@ -1,3 +1,10 @@
+master
+------
+- add `FEAT` and `OPTS MLST` commands to the server: MLST/MLSD facts are now
+  negotiable per control connection (`Client.feat` and
+  `Client.set_mlst_facts` on the client side). Facts unavailable from the
+  path io backend are omitted instead of being fabricated
+
 0.28.3 (2026-09-19)
 -------------------
 - client `is_dir` should treat `cdir` and `pdir` as a directory too, according to RFC3659 (fixes #211)

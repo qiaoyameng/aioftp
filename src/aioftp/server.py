@@ -611,6 +611,9 @@ class MLSXFacts(TypedDict, total=False):
     Type: Literal["file", "dir", "unknown"]
 
 
+DEFAULT_MLST_FACTS: tuple[str, ...] = ("Size", "Create", "Modify", "Type")
+
+
 class Server:
     """
     FTP server.
@@ -684,6 +687,11 @@ class Server:
     :type system_type: :py:class:`str`
     """
 
+    #: facts the server can provide in MLST/MLSD responses
+    available_mlst_facts: tuple[str, ...] = DEFAULT_MLST_FACTS
+    #: facts returned by MLST/MLSD unless changed with `OPTS MLST`
+    default_mlst_facts: tuple[str, ...] = DEFAULT_MLST_FACTS
+
     def __init__(
         self,
         users: Sequence[User] | AbstractUserManager | None = None,
@@ -749,10 +757,12 @@ class Server:
             "cwd": self.cwd,
             "dele": self.dele,
             "epsv": self.epsv,
+            "feat": self.feat,
             "list": self.list,
             "mkd": self.mkd,
             "mlsd": self.mlsd,
             "mlst": self.mlst,
+            "opts": self.opts,
             "pass": self.pass_,
             "pasv": self.pasv,
             "pbsz": self.pbsz,
@@ -1119,6 +1129,8 @@ class Server:
             await self.user_manager.notify_logout(connection.user)
         del connection.user
         del connection.logged
+        # per-login state: MLST/MLSD facts selection falls back to defaults
+        del connection.mlst_facts
         state, user, info = await self.user_manager.get_user(rest)
         if state == AbstractUserManager.GetUserResponse.OK:
             code = "230"
@@ -1213,11 +1225,26 @@ class Server:
         return time.strftime("%Y%m%d%H%M%S", time.gmtime(local_seconds))
 
     def _build_mlsx_facts_from_stats(self, stats: os.stat_result) -> MLSXFacts:
-        return {
-            "Size": stats.st_size,
-            "Create": self._format_mlsx_time(stats.st_ctime),
-            "Modify": self._format_mlsx_time(stats.st_mtime),
-        }
+        facts: MLSXFacts = {}
+        size = getattr(stats, "st_size", None)
+        if size is not None:
+            facts["Size"] = size
+        create = getattr(stats, "st_ctime", None)
+        if create is not None:
+            facts["Create"] = self._format_mlsx_time(create)
+        modify = getattr(stats, "st_mtime", None)
+        if modify is not None:
+            facts["Modify"] = self._format_mlsx_time(modify)
+        return facts
+
+    def get_mlst_facts(self, connection: Connection) -> tuple[str, ...]:
+        """
+        Facts selected for MLST/MLSD responses on this connection. Defaults
+        to `default_mlst_facts` unless changed with `OPTS MLST`.
+        """
+        if "mlst_facts" in connection:
+            return tuple(connection.mlst_facts)
+        return self.default_mlst_facts
 
     async def build_mlsx_string(self, connection: Connection, path: Path) -> str:
         if not await connection.path_io.exists(path):
@@ -1233,10 +1260,42 @@ class Server:
             facts["Type"] = "unknown"
 
         s = ""
-        for name, value in facts.items():
-            s += f"{name}={value};"
+        for name in self.get_mlst_facts(connection):
+            if name in facts:
+                s += f"{name}={facts[name]};"  # type: ignore[literal-required]
         s += " " + path.name
         return s
+
+    async def feat(self, connection: Connection, rest: str) -> bool:
+        facts = "".join(
+            name + ("*" if name in self.default_mlst_facts else "") + ";" for name in self.available_mlst_facts
+        )
+        connection.response("211", ["Features:", f"MLST {facts}", "End"], True)
+        return True
+
+    async def opts(self, connection: Connection, rest: str) -> bool:
+        option, _, arguments = rest.partition(" ")
+        if option.lower() != "mlst":
+            connection.response("502", f"{option!r} not implemented")
+            return True
+        requested = [name.strip() for name in arguments.split(";") if name.strip()]
+        if not requested:
+            # empty selection resets to server defaults
+            selected = list(self.default_mlst_facts)
+        else:
+            known = {name.lower(): name for name in self.available_mlst_facts}
+            selected = []
+            for name in requested:
+                canonical = known.get(name.lower())
+                if canonical is None:
+                    connection.response("501", f"unknown MLST fact {name!r}")
+                    return True
+                if canonical not in selected:
+                    selected.append(canonical)
+        connection.mlst_facts = selected
+        facts = "".join(name + ";" for name in selected)
+        connection.response("200", f"MLST OPTS {facts}")
+        return True
 
     @ConnectionConditions(
         ConnectionConditions.login_required,

@@ -6,7 +6,7 @@ import logging
 import re
 import ssl
 import sys
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Iterable, Sequence
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from types import TracebackType
@@ -899,6 +899,45 @@ class Client(BaseClient):
         :type path: :py:class:`str` or :py:class:`pathlib.PurePosixPath`
         """
         await self.command("RMD " + str(path), "250")
+
+    async def feat(self) -> list[str]:
+        """
+        :py:func:`asyncio.coroutine`
+
+        Getting server features (FEAT command).
+
+        :return: feature lines, e.g. ``["MLST Size*;Create*;Modify*;Type*;"]``
+            (``*`` marks facts enabled by default)
+        :rtype: :py:class:`list` of :py:class:`str`
+        """
+        code, info = await self.command("FEAT", "211")
+        return [line.strip() for line in info[1:-1]]
+
+    async def set_mlst_facts(self, facts: Iterable[str] | None = None) -> list[str]:
+        """
+        :py:func:`asyncio.coroutine`
+
+        Select facts returned by MLST/MLSD on this connection
+        (OPTS MLST command). Fact names are case-insensitive, duplicates are
+        ignored. An empty selection resets to the server defaults.
+
+        :param facts: fact names to select, e.g. ``["Size", "Modify"]``
+        :type facts: :py:class:`collections.abc.Iterable` of :py:class:`str`
+            or `None`
+
+        :return: facts now active on the connection
+        :rtype: :py:class:`list` of :py:class:`str`
+
+        :raises aioftp.StatusCodeError: if a fact is unknown to the server
+        """
+        names = list(facts) if facts is not None else []
+        if names:
+            command = "OPTS MLST " + ";".join(names) + ";"
+        else:
+            command = "OPTS MLST"
+        code, info = await self.command(command, "200")
+        _, _, rest = info[-1].partition("OPTS")
+        return [name.strip() for name in rest.split(";") if name.strip()]
 
     def list(
         self,
