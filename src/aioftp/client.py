@@ -215,6 +215,7 @@ class BaseClient:
         self.encoding = encoding
         self._stream: ThrottleStreamIO | None = None
         self.ssl = ssl
+        self._data_channel_protected = bool(ssl)
         self.parse_list_line_custom = parse_list_line_custom
         self.parse_list_line_custom_first = parse_list_line_custom_first
         self._passive_commands = passive_commands
@@ -222,15 +223,17 @@ class BaseClient:
         self._siosocks_asyncio_kwargs = siosocks_asyncio_kwargs
 
     async def _open_connection(self, host: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        ssl_resolved = self.ssl
-        if self._stream is not None:
-            ssl_object = self._stream.writer.transport.get_extra_info("ssl_object")
-            if ssl_object is not None:
-                ssl_resolved = SSLSessionBoundContext(
-                    ssl.PROTOCOL_TLS_CLIENT,
-                    context=ssl_object.context,
-                    session=ssl_object.session,
-                )
+        ssl_resolved: ssl.SSLContext | bool | None = None
+        if self._data_channel_protected:
+            ssl_resolved = self.ssl
+            if self._stream is not None:
+                ssl_object = self._stream.writer.transport.get_extra_info("ssl_object")
+                if ssl_object is not None:
+                    ssl_resolved = SSLSessionBoundContext(
+                        ssl.PROTOCOL_TLS_CLIENT,
+                        context=ssl_object.context,
+                        session=ssl_object.session,
+                    )
         connection: tuple[asyncio.StreamReader, asyncio.StreamWriter] = await asyncio.wait_for(
             open_connection(
                 host,
@@ -776,7 +779,23 @@ class Client(BaseClient):
         Sends the PBSZ and PROT commands as required for TLS connection.
         """
         await self.command("PBSZ 0", "200")
-        await self.command("PROT P", "200")
+        await self.set_data_channel_protection(True)
+
+    async def set_data_channel_protection(self, protected: bool = True) -> None:
+        """
+        :py:func:`asyncio.coroutine`
+
+        Switch data connection protection level by sending the ``PROT P``
+        (protected) or ``PROT C`` (clear) command. Only data connections
+        established after this call are affected, the control connection and
+        already established data connections keep their current state.
+
+        :param protected: enable or disable data connection protection
+        :type protected: :py:class:`bool`
+        """
+        level = "P" if protected else "C"
+        await self.command(f"PROT {level}", "200")
+        self._data_channel_protected = protected
 
     async def upgrade_to_tls(self, sslcontext: ssl.SSLContext | None = None) -> None:
         """
@@ -784,7 +803,9 @@ class Client(BaseClient):
 
         Attempts to upgrade the connection to TLS (explicit TLS).
         Downgrading via the CCC or REIN commands is not supported.  Both the command
-        and data channels will be encrypted after using this command.  You may
+        and data channels will be encrypted after using this command (see
+        :py:meth:`aioftp.Client.set_data_channel_protection` to switch the
+        data channel back to plain text).  You may
         call this command at any point during the connection, but not every FTP server
         will allow a connection upgrade after logging in.
 

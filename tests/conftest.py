@@ -28,6 +28,16 @@ ssl_client = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
 ca.configure_trust(ssl_client)
 
 
+@pytest.fixture
+def ssl_server_context():
+    return ssl_server
+
+
+@pytest.fixture
+def ssl_client_context():
+    return ssl_client
+
+
 class Container:
     def __init__(self, *args, **kwargs):
         self.args = args

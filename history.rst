@@ -1,3 +1,9 @@
+master (unreleased)
+-------------------
+- server: add explicit TLS support — plain text control connections can be upgraded with the `AUTH TLS` command (new `explicit_tls` parameter), `PBSZ`/`PROT` commands negotiate whether subsequently accepted data connections are protected by TLS
+- server: add `require_tls_for_login` parameter to refuse authentication on insecure control connections
+- client: add `Client.set_data_channel_protection` to switch `PROT P`/`PROT C` for subsequently created data connections
+
 0.28.3 (2026-09-19)
 -------------------
 - client `is_dir` should treat `cdir` and `pdir` as a directory too, according to RFC3659 (fixes #211)

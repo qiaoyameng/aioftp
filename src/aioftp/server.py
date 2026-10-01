@@ -673,9 +673,21 @@ class Server:
     :type encoding: :py:class:`str`
 
     :param ssl: can be set to an :py:class:`ssl.SSLContext` instance
-        to enable TLS over the accepted connections.
-        Please look :py:meth:`asyncio.loop.create_server` docs.
+        to enable TLS. By default accepted connections are implicitly
+        protected by TLS (please look :py:meth:`asyncio.loop.create_server`
+        docs). When `explicit_tls` is enabled, connections start as plain
+        text and can be upgraded with the `AUTH TLS` command instead.
     :type ssl: :py:class:`ssl.SSLContext`
+
+    :param explicit_tls: accept plain text connections and allow clients to
+        upgrade the control connection with the `AUTH TLS` command. Data
+        connections are protected by TLS only after a successful `PROT P`
+        command. Requires `ssl` to be set.
+    :type explicit_tls: :py:class:`bool`
+
+    :param require_tls_for_login: refuse authentication (`USER` command)
+        unless the control connection is already protected by TLS
+    :type require_tls_for_login: :py:class:`bool`
 
     :param welcome_message: welcome message for new connections
     :type welcome_message: :py:class:`str`
@@ -703,6 +715,8 @@ class Server:
         data_ports: Iterable[int] | None = None,
         encoding: str = "utf-8",
         ssl: ssl.SSLContext | None = None,
+        explicit_tls: bool = False,
+        require_tls_for_login: bool = False,
         welcome_message: str = "welcome",
         system_type: str = "UNIX Type: L8",
     ) -> None:
@@ -737,6 +751,8 @@ class Server:
         self.throttle_per_user: dict[User | None, StreamThrottle] = {}
         self.encoding = encoding
         self.ssl = ssl
+        self.explicit_tls = explicit_tls
+        self.require_tls_for_login = require_tls_for_login
         self.welcome_message = welcome_message
         self.system_type = system_type
         self.commands_mapping: dict[
@@ -745,6 +761,7 @@ class Server:
         ] = {
             "abor": self.abor,
             "appe": self.appe,
+            "auth": self.auth,
             "cdup": self.cdup,
             "cwd": self.cwd,
             "dele": self.dele,
@@ -798,7 +815,7 @@ class Server:
             self.dispatcher,
             host,
             port,
-            ssl=self.ssl,
+            ssl=None if self.explicit_tls else self.ssl,
             **self._start_server_extra_arguments,
         )
         for sock in self.server.sockets:
@@ -993,6 +1010,7 @@ class Server:
             response=lambda *args: response_queue.put_nowait(args),
             acquired=False,
             restart_offset=0,
+            data_connection_protected=self.ssl is not None and not self.explicit_tls,
             _dispatcher=asyncio.current_task(),
         )
         connection.path_io = self.path_io_factory(
@@ -1115,6 +1133,9 @@ class Server:
         return ok
 
     async def user(self, connection: Connection, rest: str) -> bool:
+        if self.require_tls_for_login and not self.is_control_connection_secure(connection):
+            connection.response("534", "policy requires a TLS protected control connection, use AUTH TLS first")
+            return True
         if connection.future.user.done():
             await self.user_manager.notify_logout(connection.user)
         del connection.user
@@ -1462,17 +1483,49 @@ class Server:
         connection.response(code, info)
         return True
 
-    @ConnectionConditions(ConnectionConditions.login_required)
+    @staticmethod
+    def is_control_connection_secure(connection: Connection) -> bool:
+        """
+        Check if the control connection is protected by TLS.
+        """
+        transport = connection.command_connection.writer.transport
+        return transport is not None and transport.get_extra_info("ssl_object") is not None
+
+    async def auth(self, connection: Connection, rest: str) -> bool:
+        """
+        AUTH TLS — upgrade a plain text control connection to TLS.
+
+        Commands which were already received and parsed before the upgrade
+        is finished are executed normally, so clients must wait for the 234
+        response before starting the TLS handshake and sending further
+        commands.
+        """
+        mechanism = rest.strip().upper()
+        if mechanism != "TLS":
+            connection.response("504", f"unsupported security mechanism {rest!r}")
+        elif self.ssl is None:
+            connection.response("502", "TLS is not configured on this server")
+        elif self.is_control_connection_secure(connection):
+            connection.response("503", "control connection is already protected by TLS")
+        else:
+            connection.response("234", "AUTH TLS successful")
+            await connection.command_connection.start_tls(self.ssl, server_hostname=None)
+        return True
+
     async def pbsz(self, connection: Connection, rest: str | PurePosixPath) -> bool:
         connection.response("200", "")
         return True
 
-    @ConnectionConditions(ConnectionConditions.login_required)
-    async def prot(self, connection: Connection, rest: str | PurePosixPath) -> bool:
-        if rest == "P":
-            code, info = "200", ""
+    async def prot(self, connection: Connection, rest: str) -> bool:
+        level = rest.strip().upper()
+        if level == "P":
+            connection.data_connection_protected = True
+            code, info = "200", "data connection protection set to private"
+        elif level == "C":
+            connection.data_connection_protected = False
+            code, info = "200", "data connection protection set to clear"
         else:
-            code, info = "502", ""
+            code, info = "502", f"protection level {rest!r} not implemented"
         connection.response(code, info)
         return True
 
@@ -1493,7 +1546,6 @@ class Server:
                         handler_callback,
                         connection.server_host,
                         port,
-                        ssl=self.ssl,
                         **self._start_server_extra_arguments,
                     )
                     connection.passive_server_port = port
@@ -1509,23 +1561,39 @@ class Server:
                 handler_callback,
                 connection.server_host,
                 connection.passive_server_port,
-                ssl=self.ssl,
                 **self._start_server_extra_arguments,
             )
         return passive_server
 
+    async def _accept_passive_connection(
+        self,
+        connection: Connection,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        if connection.future.data_connection.done():
+            writer.close()
+            return
+        if connection.data_connection_protected and self.ssl is not None:
+            try:
+                await writer.start_tls(  # type: ignore[attr-defined,unused-ignore]  # py3.12+
+                    self.ssl,
+                    ssl_handshake_timeout=self.socket_timeout,
+                )
+            except Exception:
+                logger.debug("data connection TLS handshake failed", exc_info=True)
+                writer.close()
+                return
+        connection.data_connection = ThrottleStreamIO(
+            reader,
+            writer,
+            throttles=connection.command_connection.throttles,
+            timeout=connection.socket_timeout,
+        )
+
     @ConnectionConditions(ConnectionConditions.login_required)
     async def pasv(self, connection: Connection, rest: str | PurePosixPath) -> bool:
-        async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            if connection.future.data_connection.done():
-                writer.close()
-            else:
-                connection.data_connection = ThrottleStreamIO(
-                    reader,
-                    writer,
-                    throttles=connection.command_connection.throttles,
-                    timeout=connection.socket_timeout,
-                )
+        handler = functools.partial(self._accept_passive_connection, connection)
 
         if not connection.future.passive_server.done():
             coro = self._start_passive_server(connection, handler)
@@ -1561,16 +1629,7 @@ class Server:
 
     @ConnectionConditions(ConnectionConditions.login_required)
     async def epsv(self, connection: Connection, rest: str | PurePosixPath) -> bool:
-        async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            if connection.future.data_connection.done():
-                writer.close()
-            else:
-                connection.data_connection = ThrottleStreamIO(
-                    reader,
-                    writer,
-                    throttles=connection.command_connection.throttles,
-                    timeout=connection.socket_timeout,
-                )
+        handler = functools.partial(self._accept_passive_connection, connection)
 
         if rest:
             code, info = "522", ["custom protocols support not implemented"]
