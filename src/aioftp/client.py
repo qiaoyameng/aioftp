@@ -31,6 +31,8 @@ from .common import (
     AbstractAsyncLister,
     AsyncEnterableInstanceProtocol,
     Code,
+    LocalToNetworkNewlineTranslator,
+    NetworkToLocalNewlineTranslator,
     SSLSessionBoundContext,
     StreamThrottle,
     ThrottleStreamIO,
@@ -87,6 +89,8 @@ class DataConnectionThrottleStreamIO(ThrottleStreamIO):
         timeout: float | int | None = None,
         read_timeout: float | int | None = None,
         write_timeout: float | int | None = None,
+        read_translator: NetworkToLocalNewlineTranslator | None = None,
+        write_translator: LocalToNetworkNewlineTranslator | None = None,
     ) -> None:
         super().__init__(
             reader,
@@ -95,6 +99,8 @@ class DataConnectionThrottleStreamIO(ThrottleStreamIO):
             timeout=timeout,
             read_timeout=read_timeout,
             write_timeout=write_timeout,
+            read_translator=read_translator,
+            write_translator=write_translator,
         )
         self.client = client
 
@@ -117,6 +123,7 @@ class DataConnectionThrottleStreamIO(ThrottleStreamIO):
         :type wait_codes: :py:class:`tuple` of :py:class:`str` or
             :py:class:`str`
         """
+        await self.flush_writes()
         self.close()
         await self.client.command(None, expected_codes, wait_codes)
 
@@ -1129,6 +1136,7 @@ class Client(BaseClient):
         destination: PathLike,
         *,
         offset: int = 0,
+        conn_type: ConnType = "I",
     ) -> AsyncEnterableInstanceProtocol[DataConnectionThrottleStreamIO]:
         """
         Create stream for write data to `destination` file.
@@ -1139,12 +1147,19 @@ class Client(BaseClient):
         :param offset: byte offset for stream start position
         :type offset: :py:class:`int`
 
+        :param conn_type: connection type ("I", "A"). In TYPE A (ASCII)
+            mode local newlines are streamed to NVT ``CR LF`` and bare
+            carriage returns are escaped as ``CR NUL``; `offset` is not
+            supported in that mode
+        :type conn_type: :py:class:`str`
+
         :rtype: :py:class:`aioftp.DataConnectionThrottleStreamIO`
         """
         return self.get_stream(
             "STOR " + str(destination),
             "1xx",
             offset=offset,
+            conn_type=conn_type,
         )
 
     def append_stream(
@@ -1152,6 +1167,7 @@ class Client(BaseClient):
         destination: PathLike,
         *,
         offset: int = 0,
+        conn_type: ConnType = "I",
     ) -> AsyncEnterableInstanceProtocol[DataConnectionThrottleStreamIO]:
         """
         Create stream for append (write) data to `destination` file.
@@ -1162,12 +1178,17 @@ class Client(BaseClient):
         :param offset: byte offset for stream start position
         :type offset: :py:class:`int`
 
+        :param conn_type: connection type ("I", "A"); see
+            :py:meth:`aioftp.Client.upload_stream`
+        :type conn_type: :py:class:`str`
+
         :rtype: :py:class:`aioftp.DataConnectionThrottleStreamIO`
         """
         return self.get_stream(
             "APPE " + str(destination),
             "1xx",
             offset=offset,
+            conn_type=conn_type,
         )
 
     async def upload(
@@ -1177,6 +1198,7 @@ class Client(BaseClient):
         *,
         write_into: bool = False,
         block_size: int = DEFAULT_BLOCK_SIZE,
+        conn_type: ConnType = "I",
     ) -> None:
         """
         :py:func:`asyncio.coroutine`
@@ -1197,6 +1219,10 @@ class Client(BaseClient):
 
         :param block_size: block size for transaction
         :type block_size: :py:class:`int`
+
+        :param conn_type: connection type ("I", "A"). TYPE A translates
+            local newlines to NVT ``CR LF`` while streaming
+        :type conn_type: :py:class:`str`
         """
         source = Path(source)
         destination = PurePosixPath(destination)
@@ -1204,7 +1230,10 @@ class Client(BaseClient):
             destination = destination / source.name
         if await self.path_io.is_file(source):
             await self.make_directory(destination.parent)
-            async with self.path_io.open(source, mode="rb") as file_in, self.upload_stream(destination) as stream:
+            async with (
+                self.path_io.open(source, mode="rb") as file_in,
+                self.upload_stream(destination, conn_type=conn_type) as stream,
+            ):
                 async for block in file_in.iter_by_block(block_size):
                     await stream.write(block)
         elif await self.path_io.is_dir(source):
@@ -1228,6 +1257,7 @@ class Client(BaseClient):
                             relative,
                             write_into=True,
                             block_size=block_size,
+                            conn_type=conn_type,
                         )
 
     def download_stream(
@@ -1235,6 +1265,7 @@ class Client(BaseClient):
         source: PathLike,
         *,
         offset: int = 0,
+        conn_type: ConnType = "I",
     ) -> AsyncEnterableInstanceProtocol[DataConnectionThrottleStreamIO]:
         """
         :py:func:`asyncio.coroutine`
@@ -1247,9 +1278,15 @@ class Client(BaseClient):
         :param offset: byte offset for stream start position
         :type offset: :py:class:`int`
 
+        :param conn_type: connection type ("I", "A"). In TYPE A (ASCII)
+            mode NVT ``CR LF`` is streamed to the local newline and
+            ``CR NUL`` to a bare carriage return; `offset` is not
+            supported in that mode
+        :type conn_type: :py:class:`str`
+
         :rtype: :py:class:`aioftp.DataConnectionThrottleStreamIO`
         """
-        return self.get_stream("RETR " + str(source), "1xx", offset=offset)
+        return self.get_stream("RETR " + str(source), "1xx", offset=offset, conn_type=conn_type)
 
     async def download(
         self,
@@ -1258,6 +1295,7 @@ class Client(BaseClient):
         *,
         write_into: bool = False,
         block_size: int = DEFAULT_BLOCK_SIZE,
+        conn_type: ConnType = "I",
     ) -> None:
         """
         :py:func:`asyncio.coroutine`
@@ -1278,6 +1316,10 @@ class Client(BaseClient):
 
         :param block_size: block size for transaction
         :type block_size: :py:class:`int`
+
+        :param conn_type: connection type ("I", "A"). TYPE A translates
+            NVT newlines to the local convention while streaming
+        :type conn_type: :py:class:`str`
         """
         source = PurePosixPath(source)
         destination_path = Path(destination)
@@ -1291,7 +1333,7 @@ class Client(BaseClient):
             )
             async with (
                 self.path_io.open(destination_path, mode="wb") as file_out,
-                self.download_stream(source) as stream,
+                self.download_stream(source, conn_type=conn_type) as stream,
             ):
                 async for block in stream.iter_by_block(block_size):
                     await file_out.write(block)
@@ -1305,6 +1347,7 @@ class Client(BaseClient):
                         full,
                         write_into=True,
                         block_size=block_size,
+                        conn_type=conn_type,
                     )
 
     async def quit(self) -> None:
@@ -1402,16 +1445,30 @@ class Client(BaseClient):
 
         :rtype: :py:class:`aioftp.DataConnectionThrottleStreamIO`
         """
+        if conn_type == "A" and offset:
+            raise ValueError(
+                "REST offsets are not supported in TYPE A (ASCII) mode: "
+                "network (NVT) offsets do not map to local file byte "
+                "positions because of newline translation",
+            )
         reader, writer = await self.get_passive_connection(conn_type)
         if offset:
             await self.command("REST " + str(offset), "350")
         await self.command(command, expected_codes, wait_codes, censor_after)
+        if conn_type == "A":
+            read_translator = NetworkToLocalNewlineTranslator()
+            write_translator = LocalToNetworkNewlineTranslator()
+        else:
+            read_translator = None
+            write_translator = None
         stream = DataConnectionThrottleStreamIO(
             self,
             reader,
             writer,
             throttles={"_": self.throttle},
             timeout=self.socket_timeout,
+            read_translator=read_translator,
+            write_translator=write_translator,
         )
         return stream
 

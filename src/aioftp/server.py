@@ -20,6 +20,8 @@ from .common import (
     END_OF_LINE,
     HALF_OF_YEAR_IN_SECONDS,
     Connection,
+    LocalToNetworkNewlineTranslator,
+    NetworkToLocalNewlineTranslator,
     StreamIO,
     StreamThrottle,
     ThrottleStreamIO,
@@ -993,6 +995,7 @@ class Server:
             response=lambda *args: response_queue.put_nowait(args),
             acquired=False,
             restart_offset=0,
+            transfer_type="I",
             _dispatcher=asyncio.current_task(),
         )
         connection.path_io = self.path_io_factory(
@@ -1392,6 +1395,13 @@ class Server:
         async def stor_worker(self: "Server", connection: Connection, rest: str | PurePosixPath) -> bool:
             stream = connection.data_connection
             del connection.data_connection
+            if connection.restart_offset and connection.transfer_type == "A":
+                stream.close()
+                connection.response(
+                    "501",
+                    "REST is not supported in TYPE A (ASCII) mode",
+                )
+                return True
             if connection.restart_offset:
                 file_mode = "r+b"
             else:
@@ -1436,12 +1446,20 @@ class Server:
         async def retr_worker(self: "Server", connection: Connection, rest: str | PurePosixPath) -> bool:
             stream = connection.data_connection
             del connection.data_connection
+            if connection.restart_offset and connection.transfer_type == "A":
+                stream.close()
+                connection.response(
+                    "501",
+                    "REST is not supported in TYPE A (ASCII) mode",
+                )
+                return True
             file_in = connection.path_io.open(real_path, mode="rb")
             async with file_in, stream:
                 if connection.restart_offset:
                     await file_in.seek(connection.restart_offset)
                 async for data in file_in.iter_by_block(connection.block_size):
                     await stream.write(data)
+                await stream.flush_writes()
             connection.response("226", "data transfer done")
             return True
 
@@ -1514,18 +1532,41 @@ class Server:
             )
         return passive_server
 
+    @staticmethod
+    def _make_data_stream(
+        connection: Connection,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> ThrottleStreamIO:
+        """
+        Create the data connection stream, attaching newline translators
+        for TYPE A (ASCII) transfers. In ASCII mode data received from the
+        wire (STOR/APPE) is translated NVT -> local before touching the
+        file, and data sent over the wire (RETR) is translated local ->
+        NVT. TYPE I transfers remain byte-for-byte.
+        """
+        if connection.transfer_type == "A":
+            read_translator = NetworkToLocalNewlineTranslator()
+            write_translator = LocalToNetworkNewlineTranslator()
+        else:
+            read_translator = None
+            write_translator = None
+        return ThrottleStreamIO(
+            reader,
+            writer,
+            throttles=connection.command_connection.throttles,
+            timeout=connection.socket_timeout,
+            read_translator=read_translator,
+            write_translator=write_translator,
+        )
+
     @ConnectionConditions(ConnectionConditions.login_required)
     async def pasv(self, connection: Connection, rest: str | PurePosixPath) -> bool:
         async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             if connection.future.data_connection.done():
                 writer.close()
             else:
-                connection.data_connection = ThrottleStreamIO(
-                    reader,
-                    writer,
-                    throttles=connection.command_connection.throttles,
-                    timeout=connection.socket_timeout,
-                )
+                connection.data_connection = self._make_data_stream(connection, reader, writer)
 
         if not connection.future.passive_server.done():
             coro = self._start_passive_server(connection, handler)
@@ -1565,12 +1606,7 @@ class Server:
             if connection.future.data_connection.done():
                 writer.close()
             else:
-                connection.data_connection = ThrottleStreamIO(
-                    reader,
-                    writer,
-                    throttles=connection.command_connection.throttles,
-                    timeout=connection.socket_timeout,
-                )
+                connection.data_connection = self._make_data_stream(connection, reader, writer)
 
         if rest:
             code, info = "522", ["custom protocols support not implemented"]
@@ -1612,6 +1648,13 @@ class Server:
         return await self.stor(connection, rest, "ab")
 
     async def rest(self, connection: Connection, rest: str) -> bool:
+        if connection.transfer_type == "A":
+            connection.restart_offset = 0
+            connection.response(
+                "501",
+                "REST offset not supported in TYPE A (ASCII) mode",
+            )
+            return True
         if rest.isdigit():
             connection.restart_offset = int(rest)
             connection.response("350", f"restarting at {rest}")

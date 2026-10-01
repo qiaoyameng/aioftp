@@ -25,6 +25,9 @@ __all__ = (
     "ThrottleStreamIO",
     "END_OF_LINE",
     "DEFAULT_BLOCK_SIZE",
+    "LOCAL_LINE_ENDING",
+    "NetworkToLocalNewlineTranslator",
+    "LocalToNetworkNewlineTranslator",
     "wrap_with_container",
     "AsyncStreamIterator",
     "AbstractAsyncLister",
@@ -43,6 +46,12 @@ __all__ = (
 
 END_OF_LINE = "\r\n"
 DEFAULT_BLOCK_SIZE = 8192
+#: Newline convention used for *local* files during TYPE A (ASCII)
+#: transfers. The wire representation is always NVT ASCII (CRLF, with bare
+#: carriage returns escaped as ``CR NUL``); this constant defines what
+#: line endings are converted to/from on the local side. Files are handled
+#: as raw bytes, so this is independent of the host operating system.
+LOCAL_LINE_ENDING = b"\n"
 
 DEFAULT_PORT = 21
 DEFAULT_USER = "anonymous"
@@ -54,6 +63,131 @@ TWO_YEARS_IN_SECONDS = ((365 * 3 + 366) * 24 * 60 * 60) / 2
 
 def _now() -> float:
     return asyncio.get_running_loop().time()
+
+
+class NetworkToLocalNewlineTranslator:
+    """
+    Streaming translator from NVT ASCII (the FTP TYPE A wire format) to
+    the local newline convention (:data:`LOCAL_LINE_ENDING`).
+
+    NVT uses ``CR LF`` for line ends and escapes a bare carriage return as
+    ``CR NUL``. The translator is a pure byte state machine: feed it data in
+    chunks of *any* size (even a single byte) and a carriage return split
+    across two chunks is handled correctly. No text decoding is performed,
+    so arbitrary byte content can never be corrupted by a multibyte
+    character crossing a chunk boundary.
+
+    On EOF, a trailing carriage return with neither ``LF`` nor ``NUL``
+    following is delivered verbatim (a bare ``CR``), preserving the data
+    instead of silently swallowing it.
+    """
+
+    __slots__ = ("_pending_cr",)
+
+    def __init__(self) -> None:
+        self._pending_cr = False
+
+    def translate(self, data: bytes) -> bytes:
+        """
+        Translate a chunk of NVT ASCII bytes.
+
+        :param data: bytes read from the network
+        :rtype: :py:class:`bytes`
+        """
+        if not data:
+            return b""
+        out = bytearray()
+        pending_cr = self._pending_cr
+        for byte in data:
+            if pending_cr:
+                pending_cr = False
+                if byte == 0x0A:
+                    out += LOCAL_LINE_ENDING
+                elif byte == 0x00:
+                    out.append(0x0D)
+                else:
+                    out.append(0x0D)
+                    if byte == 0x0D:
+                        pending_cr = True
+                    else:
+                        out.append(byte)
+            elif byte == 0x0D:
+                pending_cr = True
+            else:
+                out.append(byte)
+        self._pending_cr = pending_cr
+        return bytes(out)
+
+    def flush(self) -> bytes:
+        """
+        Emit any buffered state at end of stream.
+
+        :rtype: :py:class:`bytes`
+        """
+        if self._pending_cr:
+            self._pending_cr = False
+            return b"\r"
+        return b""
+
+
+class LocalToNetworkNewlineTranslator:
+    """
+    Streaming translator from the local newline convention
+    (:data:`LOCAL_LINE_ENDING`) to NVT ASCII (the FTP TYPE A wire format).
+
+    Local line endings become ``CR LF`` and bare carriage returns (i.e.
+    ``CR`` bytes not part of a local line ending) are escaped as ``CR NUL``
+    to survive a round trip. Like :class:`NetworkToLocalNewlineTranslator`
+    this is a byte state machine: a local line ending or a bare ``CR``
+    split across two chunks is translated correctly without any decoding.
+    """
+
+    __slots__ = ("_pending_cr",)
+
+    def __init__(self) -> None:
+        self._pending_cr = False
+
+    def translate(self, data: bytes) -> bytes:
+        """
+        Translate a chunk of local bytes to NVT ASCII.
+
+        :param data: bytes read from a local file
+        :rtype: :py:class:`bytes`
+        """
+        if not data:
+            return b""
+        out = bytearray()
+        pending_cr = self._pending_cr
+        for byte in data:
+            if pending_cr:
+                pending_cr = False
+                if byte == 0x0A:
+                    out += b"\r\n"
+                else:
+                    out += b"\r\x00"
+                    if byte == 0x0D:
+                        pending_cr = True
+                    else:
+                        out.append(byte)
+            elif byte == 0x0D:
+                pending_cr = True
+            elif byte == 0x0A:
+                out += b"\r\n"
+            else:
+                out.append(byte)
+        self._pending_cr = pending_cr
+        return bytes(out)
+
+    def flush(self) -> bytes:
+        """
+        Emit any buffered state at end of stream.
+
+        :rtype: :py:class:`bytes`
+        """
+        if self._pending_cr:
+            self._pending_cr = False
+            return b"\r\x00"
+        return b""
 
 
 WithTimeOutParamSpec = ParamSpec("WithTimeOutParamSpec")
@@ -612,9 +746,20 @@ class ThrottleStreamIO(StreamIO):
         timeout: float | int | None = None,
         read_timeout: float | int | None = None,
         write_timeout: float | int | None = None,
+        read_translator: NetworkToLocalNewlineTranslator | None = None,
+        write_translator: LocalToNetworkNewlineTranslator | None = None,
     ):
         super().__init__(reader, writer, timeout=timeout, read_timeout=read_timeout, write_timeout=write_timeout)
         self.throttles = throttles
+        # When set, bytes read from the wire pass through `read_translator`
+        # and bytes written to the wire pass through `write_translator`.
+        # This is how TYPE A (ASCII) transfers are streamed: translation
+        # happens per byte and never via "decode each chunk and join", which
+        # would corrupt data split across chunk boundaries.
+        self.read_translator = read_translator
+        self.write_translator = write_translator
+        self._read_buffer = bytearray()
+        self._read_eof = False
 
     async def wait(self, name: str) -> None:
         """
@@ -654,20 +799,58 @@ class ThrottleStreamIO(StreamIO):
         """
         :py:func:`asyncio.coroutine`
 
-        :py:meth:`aioftp.StreamIO.read` proxy
+        :py:meth:`aioftp.StreamIO.read` proxy. When a read translator is
+        attached (TYPE A downloads), translation is streamed across reads:
+        translation never happens by joining separately decoded chunks, so
+        a carriage return (or any byte) landing on a chunk boundary is
+        handled. `count` limits the number of *translated* bytes returned;
+        underlying reads are repeated until enough output is available or
+        the wire reaches EOF, at which point the translator is flushed
+        (delivering a possible trailing bare ``CR``).
         """
-        await self.wait("read")
-        start = _now()
-        data = await super().read(count)
-        self.append("read", data, start)
+        if self.read_translator is None:
+            await self.wait("read")
+            start = _now()
+            data = await super().read(count)
+            self.append("read", data, start)
+            return data
+        if not self._read_eof and (count < 0 or len(self._read_buffer) < count):
+            while not self._read_eof and (count < 0 or len(self._read_buffer) < count):
+                await self.wait("read")
+                start = _now()
+                raw = await StreamIO.read(self, count)
+                self.append("read", raw, start)
+                if raw:
+                    self._read_buffer += self.read_translator.translate(raw)
+                else:
+                    self._read_buffer += self.read_translator.flush()
+                    self._read_eof = True
+        if count < 0:
+            data = bytes(self._read_buffer)
+            self._read_buffer.clear()
+        else:
+            data = bytes(self._read_buffer[:count])
+            del self._read_buffer[:count]
         return data
 
     async def readline(self) -> bytes:
         """
         :py:func:`asyncio.coroutine`
 
-        :py:meth:`aioftp.StreamIO.readline` proxy
+        :py:meth:`aioftp.StreamIO.readline` proxy. With a read translator
+        attached the line is read byte by byte so that line boundaries are
+        defined by the *translated* stream rather than the wire bytes.
         """
+        if self.read_translator is not None:
+            out = bytearray()
+            while True:
+                chunk = await self.read(1)
+                if not chunk:
+                    break
+                out += chunk
+                if chunk == b"\n":
+                    break
+            return bytes(out)
         await self.wait("read")
         start = _now()
         data = await super().readline()
@@ -678,12 +861,37 @@ class ThrottleStreamIO(StreamIO):
         """
         :py:func:`asyncio.coroutine`
 
-        :py:meth:`aioftp.StreamIO.write` proxy
+        :py:meth:`aioftp.StreamIO.write` proxy. When a write translator is
+        attached (TYPE A uploads), `data` is streamed through the
+        translator before reaching the wire. Call :meth:`flush_writes`
+        after the final write to emit buffered state (a bare trailing
+        ``CR`` becomes ``CR NUL``).
         """
+        if self.write_translator is not None:
+            data = self.write_translator.translate(data)
         await self.wait("write")
         start = _now()
         await super().write(data)
         self.append("write", data, start)
+
+    async def flush_writes(self) -> None:
+        """
+        :py:func:`asyncio.coroutine`
+
+        Flush the write translator (TYPE A uploads), emitting any bytes
+        buffered by a chunk-boundary state. The translator output is
+        already wire data, so it bypasses translation (unlike
+        :meth:`write`) but still passes through the throttles. No-op
+        without a translator.
+        """
+        if self.write_translator is None:
+            return
+        tail = self.write_translator.flush()
+        if tail:
+            await self.wait("write")
+            start = _now()
+            await StreamIO.write(self, tail)
+            self.append("write", tail, start)
 
     async def __aenter__(self) -> Self:
         return self
