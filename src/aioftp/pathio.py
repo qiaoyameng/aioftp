@@ -2,7 +2,9 @@ import abc
 import asyncio
 import functools
 import io
+import itertools
 import operator
+import os
 import stat
 import sys
 import time
@@ -220,6 +222,36 @@ class PathlibOpenKwargs(TypedDict, total=False):
 PathType = TypeVar("PathType", bound=PurePath)
 
 
+def _unique_name_candidates(name_hint: str) -> Iterator[str]:
+    """
+    Endless stream of file name candidates based on `name_hint`: the hint
+    itself, then the hint with a numeric suffix injected before the
+    extension ("data.txt" -> "data.1.txt", "data.2.txt", ...).
+    """
+    yield name_hint
+    path = PurePosixPath(name_hint)
+    for i in itertools.count(1):
+        yield f"{path.stem}.{i}{path.suffix}"
+
+
+def _create_unique_file_blocking(directory: Path, name_hint: str) -> Path:
+    """
+    Atomically create a new empty file with a unique name based on
+    `name_hint` inside `directory` and return its path. Relies on
+    :py:const:`os.O_EXCL` instead of a racy exists-then-open sequence.
+    """
+    for name in _unique_name_candidates(name_hint):
+        candidate = directory / name
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            continue
+        else:
+            os.close(fd)
+            return candidate
+    raise RuntimeError("unreachable")  # pragma: no cover
+
+
 class AbstractPathIO(Generic[PathType], abc.ABC):
     """
     Abstract class for path io operations.
@@ -232,6 +264,11 @@ class AbstractPathIO(Generic[PathType], abc.ABC):
 
     :param state: shared pathio state per server
     """
+
+    #: Whether this backend can atomically create a uniquely named file
+    #: (required by the STOU command). Backends which can should set this
+    #: to `True` and implement :py:meth:`create_unique_file`.
+    supports_unique_file_creation: bool = False
 
     def __init__(
         self,
@@ -396,6 +433,28 @@ class AbstractPathIO(Generic[PathType], abc.ABC):
         :return: file-object
         """
 
+    @universal_exception
+    async def create_unique_file(self, directory: PathType, name_hint: str) -> PathType:
+        """
+        :py:func:`asyncio.coroutine`
+
+        Atomically create a new empty file with a unique name based on
+        `name_hint` inside `directory` and return its path. Implementations
+        must not check for existence separately from creation (no
+        exists-then-open race), so concurrent creators never share a file.
+
+        :param directory: directory to create the file in
+        :type directory: :py:class:`pathlib.Path`
+
+        :param name_hint: desired file name, used as a base for unique name
+            generation
+        :type name_hint: :py:class:`str`
+
+        :return: path of the newly created file
+        :rtype: :py:class:`pathlib.Path`
+        """
+        raise NotImplementedError
+
     def open(self, *args: Unpack[tuple[PathType]], **kwargs: Unpack[_OpenKwargs]) -> AsyncPathIOContext:
         """
         Create instance of :py:class:`aioftp.pathio.AsyncPathIOContext`,
@@ -489,6 +548,8 @@ class PathIO(AbstractPathIO[Path]):
     Blocking path io. Directly based on :py:class:`pathlib.Path` methods.
     """
 
+    supports_unique_file_creation = True
+
     @universal_exception
     async def exists(self, path: Path) -> bool:
         return path.exists()
@@ -549,6 +610,10 @@ class PathIO(AbstractPathIO[Path]):
             errors=errors,
             newline=newline,
         )
+
+    @universal_exception
+    async def create_unique_file(self, directory: Path, name_hint: str) -> Path:
+        return _create_unique_file_blocking(directory, name_hint)
 
     @universal_exception
     @defend_file_methods
@@ -617,6 +682,8 @@ class AsyncPathIO(AbstractPathIO[Path]):
     :param executor: executor for running blocking tasks
     :type executor: :py:class:`concurrent.futures.Executor`
     """
+
+    supports_unique_file_creation = True
 
     def __init__(
         self,
@@ -711,6 +778,12 @@ class AsyncPathIO(AbstractPathIO[Path]):
         )
 
     @universal_exception
+    @with_timeout
+    @_blocking_io
+    def create_unique_file(self, directory: Path, name_hint: str) -> Path:
+        return _create_unique_file_blocking(directory, name_hint)
+
+    @universal_exception
     @defend_file_methods
     @with_timeout
     @_blocking_io
@@ -801,6 +874,8 @@ class MemoryPathIO(AbstractPathIO[PurePosixPath]):
     Non-blocking path io. Based on in-memory tree. It is just proof of concept
     and probably not so fast as it can be.
     """
+
+    supports_unique_file_creation = True
 
     class Stats(NamedTuple):
         st_size: int
@@ -1013,6 +1088,23 @@ class MemoryPathIO(AbstractPathIO[PurePosixPath]):
         else:
             raise ValueError(f"invalid mode: {mode}")
         return file_like
+
+    @universal_exception
+    async def create_unique_file(self, directory: PurePosixPath, name_hint: str) -> PurePosixPath:
+        parent = self.get_node(directory)
+        if parent is None:
+            raise FileNotFoundError
+        if not isinstance(parent.content, list):
+            raise NotADirectoryError
+        # no awaits between the existence check and the node insertion,
+        # so creation is atomic with respect to other coroutines
+        for name in _unique_name_candidates(name_hint):
+            candidate = directory / name
+            if self.get_node(candidate) is None:
+                node = Node("file", name, content=io.BytesIO())
+                parent.content.append(node)
+                return candidate
+        raise RuntimeError("unreachable")  # pragma: no cover
 
     @universal_exception
     @defend_file_methods

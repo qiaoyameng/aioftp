@@ -1,3 +1,4 @@
+from pathlib import PurePosixPath
 from types import TracebackType
 from typing import Any
 
@@ -9,6 +10,7 @@ __all__ = (
     "PathIsNotAbsolute",
     "PathIOError",
     "NoAvailablePort",
+    "UploadIncompleteError",
 )
 
 
@@ -93,6 +95,25 @@ class NoAvailablePort(AIOFTPException, OSError):
     """
     Raised when there is no available data port
     """
+
+
+class UploadIncompleteError(AIOFTPException):
+    """
+    Raised when an upload to a server-generated unique file (STOU) failed
+    after the server had already created the file, so a partially written
+    file may remain on the server. If the upload fails before the file is
+    created, the original exception (e.g. :py:class:`aioftp.StatusCodeError`)
+    is raised instead.
+
+    :param path: actual path of the incomplete file on the server
+    :type path: :py:class:`pathlib.PurePosixPath`
+    """
+
+    def __init__(self, path: PurePosixPath) -> None:
+        super().__init__(
+            f"upload did not complete, partial file may remain on server: {str(path)!r}",
+        )
+        self.path = path
 
 
 class InvalidCommand(AIOFTPException, ValueError):

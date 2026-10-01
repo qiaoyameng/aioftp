@@ -75,6 +75,10 @@ class DataConnectionThrottleStreamIO(ThrottleStreamIO):
 
     :param **kwargs: keyword arguments passed to
         :py:class:`aioftp.ThrottleStreamIO`
+
+    :ivar unique_path: actual path of the file on the server, assigned by
+        the server. Set only for streams created by
+        :py:meth:`aioftp.Client.upload_unique_stream`, `None` otherwise
     """
 
     def __init__(
@@ -97,6 +101,7 @@ class DataConnectionThrottleStreamIO(ThrottleStreamIO):
             write_timeout=write_timeout,
         )
         self.client = client
+        self.unique_path: PurePosixPath | None = None
 
     async def finish(
         self,
@@ -465,6 +470,21 @@ class BaseClient:
                         directory += '"'
                     directory += ch
         return PurePosixPath(directory)
+
+    @staticmethod
+    def parse_stou_response(s: str) -> PurePosixPath:
+        """
+        Parsing `STOU` server response (`FILE: <path>`).
+
+        :param s: response line
+        :type s: :py:class:`str`
+
+        :rtype: :py:class:`pathlib.PurePosixPath`
+        """
+        prefix = "FILE: "
+        if not s.startswith(prefix):
+            raise ValueError(f"invalid STOU response: {s!r}")
+        return PurePosixPath(s[len(prefix) :])
 
     @staticmethod
     def parse_unix_mode(s: str) -> int:
@@ -1170,6 +1190,49 @@ class Client(BaseClient):
             offset=offset,
         )
 
+    @async_enterable
+    async def upload_unique_stream(
+        self,
+        destination_hint: PathLike = "",
+    ) -> DataConnectionThrottleStreamIO:
+        """
+        :py:func:`asyncio.coroutine`
+
+        Create stream for write data to a new file with a unique
+        server-generated name (STOU). The server atomically creates the
+        file based on the given name hint, so concurrent uploads never
+        overwrite each other. The actual path is available as
+        `stream.unique_path` after the stream is created.
+
+        :param destination_hint: desired path of the file on server side,
+            used as a hint for unique name generation
+        :type destination_hint: :py:class:`str` or
+            :py:class:`pathlib.PurePosixPath`
+
+        :rtype: :py:class:`aioftp.DataConnectionThrottleStreamIO`
+        """
+        hint = str(destination_hint)
+        if hint and hint != ".":
+            command = "STOU " + hint
+        else:
+            command = "STOU"
+        reader, writer = await self.get_passive_connection("I")
+        _, info = await self.command(command, "1xx")
+        stream = DataConnectionThrottleStreamIO(
+            self,
+            reader,
+            writer,
+            throttles={"_": self.throttle},
+            timeout=self.socket_timeout,
+        )
+        for line in info:
+            if line.startswith("FILE: "):
+                stream.unique_path = self.parse_stou_response(line)
+                break
+        else:
+            raise ValueError(f"server did not provide a unique file name: {info!r}")
+        return stream
+
     async def upload(
         self,
         source: str | Path,
@@ -1229,6 +1292,60 @@ class Client(BaseClient):
                             write_into=True,
                             block_size=block_size,
                         )
+
+    async def upload_unique(
+        self,
+        source: str | Path,
+        destination_hint: PathLike = "",
+        *,
+        block_size: int = DEFAULT_BLOCK_SIZE,
+    ) -> PurePosixPath:
+        """
+        :py:func:`asyncio.coroutine`
+
+        High level upload method for uploading a file to a new file with a
+        unique server-generated name (STOU). The server atomically creates
+        the file based on the given name hint, so concurrent uploads never
+        overwrite each other.
+
+        :param source: source path of file on client side
+        :type source: :py:class:`str` or :py:class:`pathlib.Path`
+
+        :param destination_hint: desired path of the file on server side,
+            used as a hint for unique name generation. If omitted, the
+            source file name is used as a hint
+        :type destination_hint: :py:class:`str` or
+            :py:class:`pathlib.PurePosixPath`
+
+        :param block_size: block size for transaction
+        :type block_size: :py:class:`int`
+
+        :return: actual path of the uploaded file on the server
+        :rtype: :py:class:`pathlib.PurePosixPath`
+
+        :raises aioftp.StatusCodeError: if the server refused to create the
+            file (nothing was created)
+        :raises aioftp.UploadIncompleteError: if the transfer failed after
+            the server had already created the file; the actual path of the
+            partially uploaded file is available as `path` attribute
+        """
+        source = Path(source)
+        destination_hint = PurePosixPath(destination_hint)
+        if destination_hint.name:
+            hint = destination_hint
+        else:
+            hint = PurePosixPath(source.name)
+        await self.make_directory(hint.parent)
+        stream: DataConnectionThrottleStreamIO | None = None
+        try:
+            async with self.path_io.open(source, mode="rb") as file_in, self.upload_unique_stream(hint) as stream:
+                async for block in file_in.iter_by_block(block_size):
+                    await stream.write(block)
+        except Exception as exc:
+            if stream is None or stream.unique_path is None:
+                raise
+            raise errors.UploadIncompleteError(stream.unique_path) from exc
+        return stream.unique_path  # type: ignore[return-value]
 
     def download_stream(
         self,

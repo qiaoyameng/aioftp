@@ -765,6 +765,7 @@ class Server:
             "rnfr": self.rnfr,
             "rnto": self.rnto,
             "stor": self.stor,
+            "stou": self.stou,
             "syst": self.syst,
             "type": self.type,
             "user": self.user,
@@ -1414,6 +1415,51 @@ class Server:
         else:
             code, info = "550", "path unreachable"
         connection.response(code, info)
+        return True
+
+    @ConnectionConditions(
+        ConnectionConditions.login_required,
+        ConnectionConditions.passive_server_started,
+    )
+    @PathPermissions(PathPermissions.writable)
+    async def stou(self, connection: Connection, rest: str | PurePosixPath) -> bool:
+        @ConnectionConditions(
+            ConnectionConditions.data_connection_made,
+            wait=True,
+            fail_code="425",
+            fail_info="Can't open data connection",
+        )
+        @worker
+        async def stou_worker(self: "Server", connection: Connection, real_path: Path) -> bool:
+            stream = connection.data_connection
+            del connection.data_connection
+            file_out = connection.path_io.open(real_path, mode="wb")
+            async with file_out, stream:
+                async for data in stream.iter_by_block(connection.block_size):
+                    await file_out.write(data)
+            connection.response("226", "data transfer done")
+            return True
+
+        if rest:
+            real_path, virtual_path = self.get_paths(connection, rest)
+            directory = real_path.parent
+            virtual_directory = virtual_path.parent
+            name_hint = real_path.name
+        else:
+            directory, virtual_directory = self.get_paths(connection, ".")
+            name_hint = "stou"
+        if not connection.path_io.supports_unique_file_creation:
+            connection.response("502", "unique file creation not supported")
+            return True
+        if not await connection.path_io.is_dir(directory):
+            connection.response("550", "path unreachable")
+            return True
+        created_path = await connection.path_io.create_unique_file(directory, name_hint)
+        created_virtual_path = virtual_directory / created_path.name
+        coro = stou_worker(self, connection, created_path)
+        task: asyncio.Task[bool] = asyncio.create_task(coro)  # type: ignore[arg-type]
+        connection.extra_workers.add(task)
+        connection.response("150", f"FILE: {created_virtual_path}")
         return True
 
     @ConnectionConditions(

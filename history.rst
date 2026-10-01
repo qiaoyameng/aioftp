@@ -1,3 +1,12 @@
+unreleased
+-------------------
+- add `STOU` command support: server atomically creates a uniquely named
+  file from a name hint (`AbstractPathIO.create_unique_file` together with
+  the `supports_unique_file_creation` capability flag), client gets the
+  actual path via `Client.upload_unique` / `Client.upload_unique_stream`
+  (`stream.unique_path`) and `UploadIncompleteError` distinguishes
+  transfers that failed after the file was created
+
 0.28.3 (2026-09-19)
 -------------------
 - client `is_dir` should treat `cdir` and `pdir` as a directory too, according to RFC3659 (fixes #211)
