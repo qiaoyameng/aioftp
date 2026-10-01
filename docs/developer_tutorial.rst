@@ -89,7 +89,7 @@ For more complex example lets try same client «COLL x» command.
 
         @aioftp.ConnectionConditions(
             aioftp.ConnectionConditions.login_required,
-            aioftp.ConnectionConditions.passive_server_started)
+            aioftp.ConnectionConditions.data_connection_prepared)
         async def coll(self, connection, rest):
 
             @aioftp.ConnectionConditions(

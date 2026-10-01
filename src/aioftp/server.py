@@ -1,8 +1,10 @@
 import abc
 import asyncio
+import contextlib
 import enum
 import errno
 import functools
+import ipaddress
 import logging
 import os
 import socket
@@ -346,9 +348,9 @@ class ConnectionConditions:
           key, user already identified
         * `ConnectionConditions.login_required` — required "logged" key, user
           already logged in.
-        * `ConnectionConditions.passive_server_started` — required
-          "passive_server" key, user already send PASV and server awaits
-          incomming connection
+        * `ConnectionConditions.data_connection_prepared` — required
+          "data_connection_prepared" key, user already sent a passive or
+          active data connection command
         * `ConnectionConditions.data_connection_made` — required
           "data_connection" key, user already connected to passive connection
         * `ConnectionConditions.rename_from_required` — required "rename_from"
@@ -369,7 +371,7 @@ class ConnectionConditions:
 
         >>> @ConnectionConditions(
         ...     ConnectionConditions.login_required,
-        ...     ConnectionConditions.passive_server_started,
+        ...     ConnectionConditions.data_connection_prepared,
         ...     ConnectionConditions.data_connection_made,
         ...     wait=True)
         ... def foo(self, connection, rest):
@@ -378,9 +380,9 @@ class ConnectionConditions:
 
     user_required = ("user", "no user (use USER firstly)")
     login_required = ("logged", "not logged in")
-    passive_server_started = (
-        "passive_server",
-        "no listen socket created (use PASV firstly)",
+    data_connection_prepared = (
+        "data_connection_prepared",
+        "no data connection prepared (use PASV, EPSV, PORT or EPRT firstly)",
     )
     data_connection_made = ("data_connection", "no data connection made")
     rename_from_required = ("rename_from", "no filename (use RNFR firstly)")
@@ -756,6 +758,8 @@ class Server:
             "pass": self.pass_,
             "pasv": self.pasv,
             "pbsz": self.pbsz,
+            "port": self.port,
+            "eprt": self.eprt,
             "prot": self.prot,
             "pwd": self.pwd,
             "quit": self.quit,
@@ -993,6 +997,7 @@ class Server:
             response=lambda *args: response_queue.put_nowait(args),
             acquired=False,
             restart_offset=0,
+            active_data_generation=0,
             _dispatcher=asyncio.current_task(),
         )
         connection.path_io = self.path_io_factory(
@@ -1050,11 +1055,13 @@ class Server:
                 for task in pending | connection.extra_workers:
                     task.cancel()
                     tasks_to_wait.append(task)
+                if "active_open_task" in connection:
+                    active_open_task = connection["active_open_task"].result()
+                    if not active_open_task.done():
+                        active_open_task.cancel()
+                        tasks_to_wait.append(active_open_task)
                 if connection.future.passive_server.done():
-                    connection.passive_server.close()
-                    if self.available_data_ports is not None:
-                        port = connection.passive_server_port
-                        self.available_data_ports.put_nowait((0, port))
+                    await self._close_passive_server(connection)
                 if connection.future.data_connection.done():
                     connection.data_connection.close()
                 stream.close()
@@ -1240,7 +1247,7 @@ class Server:
 
     @ConnectionConditions(
         ConnectionConditions.login_required,
-        ConnectionConditions.passive_server_started,
+        ConnectionConditions.data_connection_prepared,
     )
     @PathConditions(PathConditions.path_must_exists)
     @PathPermissions(PathPermissions.readable)
@@ -1255,6 +1262,7 @@ class Server:
         async def mlsd_worker(self: "Server", connection: Connection, rest: str | PurePosixPath) -> bool:
             stream = connection.data_connection
             del connection.data_connection
+            self._clear_active_data_state(connection)
             async with stream:
                 async for path in connection.path_io.list(real_path):
                     s = await self.build_mlsx_string(connection, path)
@@ -1264,6 +1272,10 @@ class Server:
             return True
 
         real_path, virtual_path = self.get_paths(connection, rest)
+        if connection.future.active_host.done():
+            await self._prepare_active_data_connection(connection)
+            if not connection.future.data_connection.done():
+                return True
         coro = mlsd_worker(self, connection, rest)
         task: asyncio.Task[bool] = asyncio.create_task(coro)  # type: ignore[arg-type]
         connection.extra_workers.add(task)
@@ -1299,7 +1311,7 @@ class Server:
 
     @ConnectionConditions(
         ConnectionConditions.login_required,
-        ConnectionConditions.passive_server_started,
+        ConnectionConditions.data_connection_prepared,
     )
     @PathConditions(PathConditions.path_must_exists)
     @PathPermissions(PathPermissions.readable)
@@ -1314,6 +1326,7 @@ class Server:
         async def list_worker(self: "Server", connection: Connection, rest: str | PurePosixPath) -> bool:
             stream = connection.data_connection
             del connection.data_connection
+            self._clear_active_data_state(connection)
             async with stream:
                 async for path in connection.path_io.list(real_path):
                     if not (await connection.path_io.exists(path)):
@@ -1326,6 +1339,10 @@ class Server:
             return True
 
         real_path, virtual_path = self.get_paths(connection, rest)
+        if connection.future.active_host.done():
+            await self._prepare_active_data_connection(connection)
+            if not connection.future.data_connection.done():
+                return True
         coro = list_worker(self, connection, rest)
         task: asyncio.Task[bool] = asyncio.create_task(coro)  # type: ignore[arg-type]
         connection.extra_workers.add(task)
@@ -1378,7 +1395,7 @@ class Server:
 
     @ConnectionConditions(
         ConnectionConditions.login_required,
-        ConnectionConditions.passive_server_started,
+        ConnectionConditions.data_connection_prepared,
     )
     @PathPermissions(PathPermissions.writable)
     async def stor(self, connection: Connection, rest: str | PurePosixPath, mode: str = "wb") -> bool:
@@ -1392,6 +1409,7 @@ class Server:
         async def stor_worker(self: "Server", connection: Connection, rest: str | PurePosixPath) -> bool:
             stream = connection.data_connection
             del connection.data_connection
+            self._clear_active_data_state(connection)
             if connection.restart_offset:
                 file_mode = "r+b"
             else:
@@ -1407,6 +1425,10 @@ class Server:
 
         real_path, virtual_path = self.get_paths(connection, rest)
         if await connection.path_io.is_dir(real_path.parent):
+            if connection.future.active_host.done():
+                await self._prepare_active_data_connection(connection)
+                if not connection.future.data_connection.done():
+                    return True
             coro = stor_worker(self, connection, rest)
             task: asyncio.Task[bool] = asyncio.create_task(coro)  # type: ignore[arg-type]
             connection.extra_workers.add(task)
@@ -1418,7 +1440,7 @@ class Server:
 
     @ConnectionConditions(
         ConnectionConditions.login_required,
-        ConnectionConditions.passive_server_started,
+        ConnectionConditions.data_connection_prepared,
     )
     @PathConditions(
         PathConditions.path_must_exists,
@@ -1436,6 +1458,7 @@ class Server:
         async def retr_worker(self: "Server", connection: Connection, rest: str | PurePosixPath) -> bool:
             stream = connection.data_connection
             del connection.data_connection
+            self._clear_active_data_state(connection)
             file_in = connection.path_io.open(real_path, mode="rb")
             async with file_in, stream:
                 if connection.restart_offset:
@@ -1446,6 +1469,10 @@ class Server:
             return True
 
         real_path, virtual_path = self.get_paths(connection, rest)
+        if connection.future.active_host.done():
+            await self._prepare_active_data_connection(connection)
+            if not connection.future.data_connection.done():
+                return True
         coro = retr_worker(self, connection, rest)
         task: asyncio.Task[bool] = asyncio.create_task(coro)  # type: ignore[arg-type]
         connection.extra_workers.add(task)
@@ -1473,6 +1500,162 @@ class Server:
             code, info = "200", ""
         else:
             code, info = "502", ""
+        connection.response(code, info)
+        return True
+
+    async def _clear_data_connection(self, connection: Connection) -> None:
+        if connection.future.data_connection.done():
+            connection.data_connection.close()
+            del connection.data_connection
+
+    async def _close_passive_server(self, connection: Connection) -> None:
+        if not connection.future.passive_server.done():
+            return
+        passive_server = connection.passive_server
+        port = connection.passive_server_port
+        del connection.passive_server
+        passive_server.close()
+        await passive_server.wait_closed()
+        if self.available_data_ports is not None and port:
+            self.available_data_ports.put_nowait((0, port))
+
+    async def _switch_to_passive(self, connection: Connection) -> None:
+        if "active_open_task" in connection:
+            active_open_task = connection["active_open_task"].result()
+            if not active_open_task.done():
+                active_open_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await active_open_task
+        self._clear_active_data_state(connection)
+
+    @staticmethod
+    def _clear_active_data_state(connection: Connection) -> None:
+        for name in ("active_host", "active_port", "active_open_task"):
+            if name in connection:
+                delattr(connection, name)
+        if connection.future.data_connection_prepared.done():
+            del connection.data_connection_prepared
+
+    @staticmethod
+    def _validate_active_endpoint(
+        connection: Connection,
+        host: str,
+        port: int,
+    ) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+        if not 1024 <= port <= 65535:
+            return None
+        try:
+            address = ipaddress.ip_address(host)
+            peer_address = ipaddress.ip_address(connection.client_host)
+        except ValueError:
+            return None
+        if address != peer_address:
+            return None
+        return address
+
+    async def _prepare_active_data_connection(self, connection: Connection) -> bool:
+        await self._clear_data_connection(connection)
+        active_host = connection.active_host
+        active_port = connection.active_port
+        generation = connection.active_data_generation
+
+        async def open_active_data_connection() -> None:
+            try:
+                connection.data_connection = ThrottleStreamIO(
+                    *(
+                        await asyncio.wait_for(
+                            asyncio.open_connection(active_host, active_port, ssl=self.ssl),
+                            connection.wait_future_timeout,
+                        )
+                    ),
+                    throttles=connection.command_connection.throttles,
+                    timeout=connection.socket_timeout,
+                )
+            except (OSError, asyncio.TimeoutError, asyncio.CancelledError):
+                raise
+
+        active_open_task = asyncio.create_task(open_active_data_connection())
+        connection.active_open_task = active_open_task
+        try:
+            await active_open_task
+            if connection.future.active_open_task.done() and connection.active_open_task is active_open_task:
+                del connection.active_open_task
+        except asyncio.CancelledError:
+            if not self.server.is_serving():
+                raise
+            if connection.active_data_generation == generation:
+                self._clear_active_data_state(connection)
+            return True
+        except (OSError, asyncio.TimeoutError):
+            if connection.active_data_generation == generation:
+                self._clear_active_data_state(connection)
+            connection.response("425", "Can't open data connection")
+            return True
+        return True
+
+    @staticmethod
+    def _parse_port_endpoint(rest: str) -> tuple[str, int] | None:
+        parts = [part for part in rest.split(",") if part]
+        if len(parts) != 6 or not all(part.isdigit() for part in parts):
+            return None
+        nums = tuple(map(int, parts))
+        if any(num < 0 or num > 255 for num in nums[:4]):
+            return None
+        if nums[4] > 255 or nums[5] > 255:
+            return None
+        return ".".join(map(str, nums[:4])), (nums[4] << 8) | nums[5]
+
+    @staticmethod
+    def _parse_eprt_endpoint(rest: str) -> tuple[str, int] | None:
+        if not rest:
+            return None
+        delimiter = rest[0]
+        parts = rest.split(delimiter)
+        if len(parts) != 5 or parts[0] or parts[-1]:
+            return None
+        _, network_protocol, host, port_text, _ = parts
+        if network_protocol not in ("1", "2") or not port_text.isdigit():
+            return None
+        port = int(port_text)
+        if not 0 <= port <= 65535:
+            return None
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            return None
+        if (network_protocol == "1" and address.version != 4) or (
+            network_protocol == "2" and address.version != 6
+        ):
+            return None
+        return host, port
+
+    async def _configure_active_data_connection(
+        self,
+        connection: Connection,
+        endpoint: tuple[str, int] | None,
+        code: str,
+        info: str,
+    ) -> bool:
+        if endpoint is None:
+            connection.response("501", "invalid data endpoint")
+            return True
+        host, port = endpoint
+        if self._validate_active_endpoint(connection, host, port) is None:
+            connection.response("501", "data endpoint address or port is not allowed")
+            return True
+        await self._close_passive_server(connection)
+        await self._clear_data_connection(connection)
+        if "active_open_task" in connection:
+            active_open_task = connection["active_open_task"].result()
+            if not active_open_task.done():
+                active_open_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await active_open_task
+        self._clear_active_data_state(connection)
+        connection.active_data_generation += 1
+        connection.active_host = host
+        connection.active_port = port
+        connection.data_connection_prepared = True
         connection.response(code, info)
         return True
 
@@ -1527,6 +1710,7 @@ class Server:
                     timeout=connection.socket_timeout,
                 )
 
+        await self._switch_to_passive(connection)
         if not connection.future.passive_server.done():
             coro = self._start_passive_server(connection, handler)
             try:
@@ -1534,6 +1718,7 @@ class Server:
             except errors.NoAvailablePort:
                 connection.response("421", ["no free ports"])
                 return False
+            connection.data_connection_prepared = True
             code, info_template = "227", "listen socket created {address}"
         else:
             code, info_template = "227", "listen socket already exists {address}"
@@ -1553,9 +1738,7 @@ class Server:
 
         nums = tuple(map(int, host.split("."))) + (port >> 8, port & 0xFF)
         info = [info_template.format(address=f"({','.join(map(str, nums))})")]
-        if connection.future.data_connection.done():
-            connection.data_connection.close()
-            del connection.data_connection
+        await self._clear_data_connection(connection)
         connection.response(code, info)
         return True
 
@@ -1576,6 +1759,7 @@ class Server:
             code, info = "522", ["custom protocols support not implemented"]
             connection.response(code, info)
             return False
+        await self._switch_to_passive(connection)
         if not connection.future.passive_server.done():
             coro = self._start_passive_server(connection, handler)
             try:
@@ -1583,6 +1767,7 @@ class Server:
             except errors.NoAvailablePort:
                 connection.response("421", ["no free ports"])
                 return False
+            connection.data_connection_prepared = True
             code, info = "229", ["listen socket created"]
         else:
             code, info = "229", ["listen socket already exists"]
@@ -1593,19 +1778,43 @@ class Server:
                 break
 
         info[0] += f" (|||{port}|)"
-        if connection.future.data_connection.done():
-            connection.data_connection.close()
-            del connection.data_connection
+        await self._clear_data_connection(connection)
         connection.response(code, info)
         return True
 
     @ConnectionConditions(ConnectionConditions.login_required)
+    async def port(self, connection: Connection, rest: str | PurePosixPath) -> bool:
+        return await self._configure_active_data_connection(
+            connection,
+            self._parse_port_endpoint(str(rest).strip()),
+            "200",
+            "active data connection address accepted",
+        )
+
+    @ConnectionConditions(ConnectionConditions.login_required)
+    async def eprt(self, connection: Connection, rest: str | PurePosixPath) -> bool:
+        return await self._configure_active_data_connection(
+            connection,
+            self._parse_eprt_endpoint(str(rest).strip()),
+            "200",
+            "active data connection address accepted",
+        )
+
+    @ConnectionConditions(ConnectionConditions.login_required)
     async def abor(self, connection: Connection, rest: str | PurePosixPath) -> bool:
+        pending_active_connection = False
         if connection.extra_workers:
             for worker in connection.extra_workers:
                 worker.cancel()
-        else:
+        elif "active_open_task" in connection:
+            active_open_task = connection["active_open_task"].result()
+            if not active_open_task.done():
+                active_open_task.cancel()
+                pending_active_connection = True
+        if not connection.extra_workers and not pending_active_connection:
             connection.response("226", "nothing to abort")
+        elif pending_active_connection:
+            connection.response("226", "abort successful")
         return True
 
     async def appe(self, connection: Connection, rest: str | PurePosixPath) -> bool:

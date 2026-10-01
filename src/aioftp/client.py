@@ -2,8 +2,10 @@ import asyncio
 import calendar
 import collections
 import contextlib
+import ipaddress
 import logging
 import re
+import socket
 import ssl
 import sys
 from collections.abc import AsyncGenerator, Sequence
@@ -182,7 +184,9 @@ class BaseClientArgs(TypedDict, total=False):
     ssl: ssl.SSLContext | bool | None
     parse_list_line_custom: ParseListLineCustomCallable | None
     parse_list_line_custom_first: bool
+    data_connection_mode: Literal["passive", "active"]
     passive_commands: tuple[str, ...]
+    active_commands: tuple[str, ...]
     siosocks_asyncio_kwargs: Any
 
 
@@ -200,7 +204,9 @@ class BaseClient:
         ssl: ssl.SSLContext | bool | None = None,
         parse_list_line_custom: ParseListLineCustomCallable | None = None,
         parse_list_line_custom_first: bool = True,
+        data_connection_mode: Literal["passive", "active"] = "passive",
         passive_commands: tuple[str, ...] = ("epsv", "pasv"),
+        active_commands: tuple[str, ...] = ("eprt", "port"),
         trust_server_pasv_ipv4_address: bool = False,
         **siosocks_asyncio_kwargs: Any,
     ):
@@ -217,9 +223,17 @@ class BaseClient:
         self.ssl = ssl
         self.parse_list_line_custom = parse_list_line_custom
         self.parse_list_line_custom_first = parse_list_line_custom_first
+        if data_connection_mode not in ("passive", "active"):
+            raise ValueError("data_connection_mode must be 'passive' or 'active'")
+        self.data_connection_mode = data_connection_mode
         self._passive_commands = passive_commands
+        self._active_commands = active_commands
         self.trust_server_pasv_ipv4_address = trust_server_pasv_ipv4_address
         self._siosocks_asyncio_kwargs = siosocks_asyncio_kwargs
+        self._active_data_server: asyncio.Server | None = None
+        self._active_data_connection_future: (
+            asyncio.Future[tuple[asyncio.StreamReader, asyncio.StreamWriter]] | None
+        ) = None
 
     async def _open_connection(self, host: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         ssl_resolved = self.ssl
@@ -263,8 +277,26 @@ class BaseClient:
         """
         Close connection.
         """
+        future = self._active_data_connection_future
+        if future is not None and not future.done():
+            future.cancel()
+        if self._active_data_server is not None and self._active_data_server.is_serving():
+            self._active_data_server.close()
+        self._active_data_server = None
+        self._active_data_connection_future = None
         if self._stream is not None:
             self._stream.close()
+
+    async def _close_active_data_server(self) -> None:
+        future = self._active_data_connection_future
+        if future is not None and not future.done():
+            future.cancel()
+        active_server = self._active_data_server
+        self._active_data_server = None
+        self._active_data_connection_future = None
+        if active_server is not None and active_server.is_serving():
+            active_server.close()
+            await active_server.wait_closed()
 
     async def parse_line(self) -> tuple[Code, str]:
         """
@@ -386,6 +418,9 @@ class BaseClient:
         if command:
             if "\r" in command or "\n" in command:
                 raise errors.InvalidCommand("Command must not contain CR/LF")
+            command_name = command.partition(" ")[0].lower()
+            if command_name in ("epsv", "pasv"):
+                await self._close_active_data_server()
             if censor_after:
                 # Censor the user's command
                 raw = command[:censor_after]
@@ -750,6 +785,14 @@ class Client(BaseClient):
     :param parse_list_line_custom_first: Should be custom parser tried first
         or last
     :type parse_list_line_custom_first: :py:class:`bool`
+
+    :param data_connection_mode: data connection mode, "passive" (PASV/EPSV)
+        or "active" (PORT/EPRT)
+    :type data_connection_mode: :py:class:`str`
+
+    :param active_commands: active data commands to try in order
+    :type active_commands: :py:class:`tuple` of :py:class:`str`
+
     :param **siosocks_asyncio_kwargs: siosocks key-word only arguments
     """
 
@@ -1329,6 +1372,159 @@ class Client(BaseClient):
             ip = None
         return ip, port
 
+    @staticmethod
+    def format_port_command(host: str, port: int) -> str:
+        address = ipaddress.IPv4Address(host)
+        return (
+            "PORT "
+            + ",".join(address.exploded.split("."))
+            + ","
+            + str(port >> 8)
+            + ","
+            + str(port & 0xFF)
+        )
+
+    @staticmethod
+    def format_eprt_command(host: str, port: int) -> str:
+        try:
+            ipaddress.IPv4Address(host)
+            network_protocol = 1
+        except ipaddress.AddressValueError:
+            ipaddress.IPv6Address(host)
+            network_protocol = 2
+        return f"EPRT |{network_protocol}|{host}|{port}|"
+
+    async def _start_active_data_server(
+        self,
+        command: str,
+        conn_type: ConnType,
+    ) -> tuple[asyncio.Server, asyncio.Future[tuple[asyncio.StreamReader, asyncio.StreamWriter]], str, int]:
+        await self._close_active_data_server()
+        control_socket: socket.socket | None = self.stream.writer.transport.get_extra_info("socket")
+        if control_socket is None:
+            raise ConnectionError("Control connection socket is unavailable")
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = loop.create_future()
+
+        def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            if future.done():
+                writer.close()
+                return
+            future.set_result((reader, writer))
+
+        active_server = await asyncio.start_server(
+            handler,
+            host=self.stream.writer.transport.get_extra_info("sockname")[0],
+            port=0,
+            family=control_socket.family,
+            ssl=self.ssl if isinstance(self.ssl, ssl.SSLContext) else None,
+        )
+        for sock in active_server.sockets:
+            if sock.family == control_socket.family:
+                active_host, port, *_ = sock.getsockname()
+                break
+        else:
+            active_server.close()
+            await active_server.wait_closed()
+            raise ConnectionError("Active data connection socket was not created")
+        if not port:
+            active_server.close()
+            await active_server.wait_closed()
+            raise ConnectionError("Active data connection port was not assigned")
+        name = command.lower()
+        if name == "port":
+            if control_socket.family != socket.AF_INET:
+                active_server.close()
+                await active_server.wait_closed()
+                raise ValueError("PORT is only supported with IPv4")
+            ftp_command = self.format_port_command(active_host, port)
+        elif name == "eprt":
+            ftp_command = self.format_eprt_command(active_host, port)
+        else:
+            active_server.close()
+            await active_server.wait_closed()
+            raise ValueError(f"{command!r} not in {'eprt', 'port'}")
+        self._active_data_server = active_server
+        self._active_data_connection_future = future
+        return active_server, future, ftp_command, port
+
+    def _available_active_commands(self, commands: Sequence[str] | None) -> tuple[str, ...]:
+        if not commands:
+            commands = self._active_commands
+        control_socket: socket.socket | None = self.stream.writer.transport.get_extra_info("socket")
+        available: list[str] = []
+        for name in commands:
+            command_name = name.lower()
+            if command_name not in ("eprt", "port"):
+                raise ValueError(f"{command_name!r} not in {'eprt', 'port'}")
+            if command_name == "port" and (
+                control_socket is None or control_socket.family != socket.AF_INET
+            ):
+                continue
+            available.append(command_name)
+        return tuple(available)
+
+    async def get_active_connection(
+        self,
+        conn_type: ConnType = "I",
+        commands: Sequence[str] | None = None,
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """
+        :py:func:`asyncio.coroutine`
+
+        Getting pair of reader, writer for an active data connection. This
+        sends PORT or EPRT and waits for the server to connect back. The
+        returned stream is not attached to a transfer command.
+
+        :param conn_type: connection type ("I", "A", "E", "L")
+        :type conn_type: :py:class:`str`
+
+        :param commands: sequence of commands to try ("eprt", "port")
+        :type commands: :py:class:`list` or :py:class:`None`
+
+        :rtype: (:py:class:`asyncio.StreamReader`,
+            :py:class:`asyncio.StreamWriter`)
+        """
+        if not commands:
+            commands = self._active_commands
+        commands = self._available_active_commands(commands)
+        if not commands:
+            raise ValueError("No active commands provided")
+        await self.command("TYPE " + conn_type, "200")
+        last_error: errors.StatusCodeError | None = None
+        for i, name in enumerate(commands, start=1):
+            try:
+                active_server, future, ftp_command, _ = await self._start_active_data_server(
+                    name,
+                    conn_type,
+                )
+                try:
+                    await self.command(ftp_command, "200")
+                    try:
+                        connection = await asyncio.wait_for(future, self.connection_timeout)
+                        if self._active_data_server is active_server:
+                            self._active_data_server = None
+                            self._active_data_connection_future = None
+                        active_server.close()
+                        await active_server.wait_closed()
+                        return connection
+                    except BaseException:
+                        self._active_data_server = None
+                        self._active_data_connection_future = None
+                        if active_server.is_serving():
+                            active_server.close()
+                            await active_server.wait_closed()
+                        raise
+                except errors.StatusCodeError:
+                    await self._close_active_data_server()
+                    raise
+            except errors.StatusCodeError as exc:
+                last_error = exc
+                is_last = i == len(commands)
+                if is_last or not exc.received_codes[-1].matches("50x"):
+                    raise
+        raise last_error if last_error is not None else ValueError("No active commands provided")
+
     async def get_passive_connection(
         self,
         conn_type: ConnType = "I",
@@ -1358,6 +1554,7 @@ class Client(BaseClient):
             commands = self._passive_commands
         if not commands:
             raise ValueError("No passive commands provided")
+        await self._close_active_data_server()
         await self.command("TYPE " + conn_type, "200")
         ip: str | None
         for i, name in enumerate(commands, start=1):
@@ -1402,10 +1599,70 @@ class Client(BaseClient):
 
         :rtype: :py:class:`aioftp.DataConnectionThrottleStreamIO`
         """
-        reader, writer = await self.get_passive_connection(conn_type)
-        if offset:
-            await self.command("REST " + str(offset), "350")
-        await self.command(command, expected_codes, wait_codes, censor_after)
+        reader: asyncio.StreamReader | None = None
+        writer: asyncio.StreamWriter | None = None
+        if self.data_connection_mode == "passive":
+            reader, writer = await self.get_passive_connection(conn_type)
+            if offset:
+                await self.command("REST " + str(offset), "350")
+            await self.command(command, expected_codes, wait_codes, censor_after)
+        else:
+            await self.command("TYPE " + conn_type, "200")
+            if offset:
+                await self.command("REST " + str(offset), "350")
+            active_commands = self._available_active_commands(None)
+            if not active_commands:
+                raise ValueError("No active commands provided")
+            last_error: errors.StatusCodeError | None = None
+            for index, active_command in enumerate(active_commands, start=1):
+                active_server, future, ftp_command, _ = await self._start_active_data_server(
+                    active_command,
+                    conn_type,
+                )
+                response_task: asyncio.Task[tuple[Code, list[str]]] | None = None
+                try:
+                    await self.command(ftp_command, "200")
+                    if command is not None:
+                        if "\r" in command or "\n" in command:
+                            raise errors.InvalidCommand("Command must not contain CR/LF")
+                        message = command + END_OF_LINE
+                        await self.stream.write(message.encode(encoding=self.encoding))
+                        response_task = asyncio.create_task(self.parse_response())
+                        wait_set: set[asyncio.Future[Any]] = {future, response_task}
+                        await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+                    assert response_task is not None
+                    received_code, info = await response_task
+                    response_task = None
+                    expected = wrap_into_codes(wrap_with_container(expected_codes))
+                    self.check_codes(expected, received_code, info)
+                    try:
+                        reader, writer = await asyncio.wait_for(future, self.connection_timeout)
+                    except BaseException:
+                        if future.done() and not future.exception():
+                            _, accepted_writer = future.result()
+                            accepted_writer.close()
+                        raise
+                    break
+                except errors.StatusCodeError as exc:
+                    if future.done() and not future.exception():
+                        _, accepted_writer = future.result()
+                        accepted_writer.close()
+                    await self._close_active_data_server()
+                    last_error = exc
+                    if index == len(active_commands) or not exc.received_codes[-1].matches("50x"):
+                        raise
+                except BaseException:
+                    if response_task is not None and not response_task.done():
+                        response_task.cancel()
+                    await self._close_active_data_server()
+                    raise
+            if reader is None or writer is None:
+                raise last_error if last_error is not None else ValueError("No active commands provided")
+            if self._active_data_server is active_server:
+                self._active_data_server = None
+                self._active_data_connection_future = None
+            active_server.close()
+            await active_server.wait_closed()
         stream = DataConnectionThrottleStreamIO(
             self,
             reader,
