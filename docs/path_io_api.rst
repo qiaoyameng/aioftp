@@ -17,6 +17,9 @@ Path abstraction layer API
 .. autoclass :: aioftp.AsyncPathIO
     :show-inheritance:
 
+.. autoclass :: aioftp.SecurePathIO
+    :show-inheritance:
+
 .. autoclass :: aioftp.MemoryPathIO
     :show-inheritance:
 

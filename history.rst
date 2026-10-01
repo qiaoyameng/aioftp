@@ -1,3 +1,17 @@
+unreleased
+----------
+- add Linux-only `SecurePathIO` path io backend, which resolves and opens
+  paths relative to a file descriptor of the FTP root directory, so symlink
+  replacement attacks can not be used to read, write, unlink or rename files
+  outside of the root. Symlinks inside the root are disallowed by default and
+  can be enabled with the `allow_symlinks` parameter (they are still never
+  allowed to point outside of the root). On unsupported platforms
+  instantiation raises `NotImplementedError`
+- server `RNFR` now captures the rename source object identity via
+  `AbstractPathIO.capture_rename_source` instead of storing a plain path, so
+  source replacement between `RNFR` and `RNTO` is detected by capable
+  backends (`SecurePathIO`)
+
 0.28.3 (2026-09-19)
 -------------------
 - client `is_dir` should treat `cdir` and `pdir` as a directory too, according to RFC3659 (fixes #211)

@@ -1,8 +1,11 @@
 import abc
 import asyncio
+import contextlib
+import errno
 import functools
 import io
 import operator
+import os
 import stat
 import sys
 import time
@@ -48,6 +51,7 @@ __all__ = (
     "PathIO",
     "AsyncPathIO",
     "MemoryPathIO",
+    "SecurePathIO",
     "PathIONursery",
 )
 
@@ -483,6 +487,27 @@ class AbstractPathIO(Generic[PathType], abc.ABC):
         :type destination: :py:class:`pathlib.Path`
         """
 
+    @universal_exception
+    async def capture_rename_source(self, path: PathType) -> Any:
+        """
+        :py:func:`asyncio.coroutine`
+
+        Capture the identity of a future :py:meth:`rename` source. The
+        returned value is passed back to :py:meth:`rename` as the `source`
+        argument. Default implementation just returns the path itself, so
+        the source object may be silently replaced between the capture and
+        the rename. Backends which are able to pin the filesystem object
+        may return an opaque token instead, allowing :py:meth:`rename` to
+        detect such replacements (this is what happens between FTP `RNFR`
+        and `RNTO` commands).
+
+        :param path: path to capture
+        :type path: :py:class:`pathlib.Path`
+
+        :return: opaque token or the path itself
+        """
+        return path
+
 
 class PathIO(AbstractPathIO[Path]):
     """
@@ -748,6 +773,399 @@ class AsyncPathIO(AbstractPathIO[Path]):
     @_blocking_io
     def rename(self, source: Path, destination: Path) -> Path:
         return source.rename(destination)
+
+
+def _secure_pathio_unsupported_reason() -> str | None:
+    """
+    Return `None` if :py:class:`SecurePathIO` can work on this platform,
+    otherwise a human readable reason why it can not.
+    """
+    if not sys.platform.startswith("linux"):
+        return "SecurePathIO is supported on Linux only"
+    missing_flags = [name for name in ("O_PATH", "O_NOFOLLOW", "O_DIRECTORY", "O_CLOEXEC") if not hasattr(os, name)]
+    if missing_flags:
+        return f"SecurePathIO requires os flags missing on this platform: {missing_flags}"
+    missing_dir_fd = [
+        f.__name__ for f in (os.open, os.stat, os.unlink, os.rename, os.mkdir, os.rmdir) if f not in os.supports_dir_fd
+    ]
+    if missing_dir_fd:
+        return f"SecurePathIO requires dir_fd support missing for: {missing_dir_fd}"
+    if os.listdir not in os.supports_fd:
+        return "SecurePathIO requires os.listdir to accept file descriptors"
+    return None
+
+
+class _SecureRenameSource:
+    """
+    Opaque token produced by :py:meth:`SecurePathIO.capture_rename_source`.
+    Holds an ``O_PATH`` file descriptor which pins the exact filesystem
+    object chosen as rename source, so a later :py:meth:`SecurePathIO.rename`
+    can detect that the source path was replaced by another object.
+    """
+
+    __slots__ = ("path", "fd")
+
+    def __init__(self, path: Path, fd: int) -> None:
+        self.path = path
+        self.fd: int | None = fd
+
+    def close(self) -> None:
+        fd = self.fd
+        if fd is not None:
+            self.fd = None
+            os.close(fd)
+
+    def __del__(self) -> None:
+        self.close()
+
+
+class SecurePathIO(AbstractPathIO[Path]):
+    """
+    Secure path io for Linux. All path resolution is performed relative to
+    a file descriptor of the FTP root directory with the ``openat()`` family
+    of syscalls, so replacing path components with symlinks *after* any
+    server-side checks can not be used to read, write, unlink or rename
+    files outside of the root directory. Users are still free to create
+    subdirectories inside the root.
+
+    On any other platform, or when the required ``dir_fd`` syscall support
+    is missing, instantiation raises :py:exc:`NotImplementedError` to
+    explicitly report the capability limit.
+
+    :param root: root directory, all paths are resolved beneath it. If not
+        given, ``connection.user.base_path`` of the current server
+        connection is used (this is what happens when the backend is used
+        as ``path_io_factory`` of :py:class:`aioftp.Server`).
+    :type root: :py:class:`str` or :py:class:`pathlib.Path` or `None`
+
+    :param allow_symlinks: allow symlinks inside the root. Symlink targets
+        are resolved, but every resolved object is verified (via its file
+        descriptor, race-free) to still be located inside the root. When
+        `False` (default), any symlink in a path leads to an error. When
+        `True`, procfs (``/proc/self/fd``) is required.
+    :type allow_symlinks: :py:class:`bool`
+    """
+
+    def __init__(
+        self,
+        timeout: float | int | None = None,
+        connection: Connection | None = None,
+        state: list["Node"] | None = None,
+        *,
+        root: str | Path | None = None,
+        allow_symlinks: bool = False,
+    ) -> None:
+        super().__init__(timeout, connection, state)
+        reason = _secure_pathio_unsupported_reason()
+        if reason is not None:
+            raise NotImplementedError(reason)
+        if allow_symlinks and not os.path.isdir("/proc/self/fd"):
+            raise NotImplementedError(
+                "SecurePathIO with allow_symlinks=True requires procfs (/proc/self/fd)",
+            )
+        self._explicit_root = None if root is None else Path(root)
+        self._root_real_cache: str | None = None
+        self.allow_symlinks = allow_symlinks
+
+    def _get_root(self) -> Path:
+        if self._explicit_root is not None:
+            return self._explicit_root
+        user = getattr(self.connection, "user", None)
+        if user is None:
+            raise ValueError(
+                "SecurePathIO root is not set and there is no logged in connection user",
+            )
+        return Path(user.base_path)
+
+    @property
+    def _root_real(self) -> str:
+        if self._root_real_cache is None:
+            self._root_real_cache = os.path.realpath(self._get_root())
+        return self._root_real_cache
+
+    def _split_relative(self, path: Path) -> tuple[str, ...]:
+        root = self._get_root()
+        path = Path(path)
+        if not path.is_absolute():
+            path = root / path
+        rel = os.path.relpath(os.path.normpath(path), os.path.normpath(root))
+        if rel == os.curdir:
+            return ()
+        parts = tuple(rel.split(os.sep))
+        if any(part in ("", os.curdir, os.pardir) for part in parts):
+            raise ValueError(f"path {path!r} escapes root {root!r}")
+        return parts
+
+    def _check_contained(self, fd: int) -> None:
+        target = os.readlink(f"/proc/self/fd/{fd}")
+        if target.endswith(" (deleted)"):
+            raise FileNotFoundError(errno.ENOENT, "file was unlinked", target)
+        root = self._root_real
+        if root != os.sep and target != root and not target.startswith(root + os.sep):
+            raise PermissionError(errno.EACCES, "resolved path escapes root", target)
+
+    @contextlib.contextmanager
+    def _walk(self, parts: tuple[str, ...]) -> Iterator[int]:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        fd = os.open(str(self._get_root()), flags)
+        try:
+            if not self.allow_symlinks:
+                flags |= os.O_NOFOLLOW
+            for part in parts:
+                next_fd = os.open(part, flags, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+                if self.allow_symlinks:
+                    self._check_contained(fd)
+            yield fd
+        finally:
+            os.close(fd)
+
+    @contextlib.contextmanager
+    def _open_parent(self, path: Path) -> Iterator[tuple[int, str]]:
+        parts = self._split_relative(path)
+        with self._walk(parts[:-1]) as fd:
+            yield fd, parts[-1] if parts else ""
+
+    def _stat(self, path: Path) -> stat_result:
+        parts = self._split_relative(path)
+        if not parts:
+            with self._walk(()) as fd:
+                return os.fstat(fd)
+        with self._open_parent(path) as (dir_fd, name):
+            stats = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if self.allow_symlinks and stat.S_ISLNK(stats.st_mode):
+                pinned_fd = os.open(name, os.O_PATH | os.O_CLOEXEC, dir_fd=dir_fd)
+                try:
+                    self._check_contained(pinned_fd)
+                    return os.fstat(pinned_fd)
+                finally:
+                    os.close(pinned_fd)
+            return stats
+
+    def _open_file(self, path: Path, flags: int) -> int:
+        with self._open_parent(path) as (dir_fd, name):
+            if not name:
+                raise IsADirectoryError(errno.EISDIR, "is a directory", str(path))
+            if not self.allow_symlinks:
+                return os.open(name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+            try:
+                stats = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                stats = None
+            if stats is None or not stat.S_ISLNK(stats.st_mode):
+                # O_NOFOLLOW keeps this safe if the entry is replaced by a
+                # symlink between the check and the open
+                return os.open(name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+            if flags & os.O_CREAT and flags & os.O_EXCL:
+                raise FileExistsError(errno.EEXIST, "file exists", str(path))
+            # pin the symlink target with an O_PATH descriptor, verify it is
+            # inside the root, then reopen the pinned object itself through
+            # procfs so a later path replacement does not matter
+            pinned_fd = os.open(name, os.O_PATH | os.O_CLOEXEC, dir_fd=dir_fd)
+            try:
+                self._check_contained(pinned_fd)
+                return os.open(f"/proc/self/fd/{pinned_fd}", (flags & ~os.O_CREAT) | os.O_CLOEXEC)
+            finally:
+                os.close(pinned_fd)
+
+    @universal_exception
+    async def exists(self, path: Path) -> bool:
+        try:
+            self._stat(path)
+        except OSError:
+            return False
+        return True
+
+    @universal_exception
+    async def is_dir(self, path: Path) -> bool:
+        try:
+            return stat.S_ISDIR(self._stat(path).st_mode)
+        except OSError:
+            return False
+
+    @universal_exception
+    async def is_file(self, path: Path) -> bool:
+        try:
+            return stat.S_ISREG(self._stat(path).st_mode)
+        except OSError:
+            return False
+
+    @universal_exception
+    async def mkdir(self, path: Path, *, parents: bool = False, exist_ok: bool = False) -> None:
+        parts = self._split_relative(path)
+        if not parts:
+            if exist_ok:
+                return
+            raise FileExistsError(errno.EEXIST, "file exists", str(path))
+        if not parents:
+            with self._open_parent(path) as (dir_fd, name):
+                try:
+                    os.mkdir(name, dir_fd=dir_fd)
+                except FileExistsError:
+                    stats = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                    if not exist_ok or not stat.S_ISDIR(stats.st_mode):
+                        raise
+            return
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        if not self.allow_symlinks:
+            flags |= os.O_NOFOLLOW
+        fd = os.open(str(self._get_root()), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            for depth, part in enumerate(parts):
+                try:
+                    os.mkdir(part, dir_fd=fd)
+                except FileExistsError:
+                    if depth == len(parts) - 1 and not exist_ok:
+                        raise
+                next_fd = os.open(part, flags, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+                if self.allow_symlinks:
+                    self._check_contained(fd)
+        finally:
+            os.close(fd)
+
+    @universal_exception
+    async def rmdir(self, path: Path) -> None:
+        with self._open_parent(path) as (dir_fd, name):
+            if not name:
+                raise PermissionError(errno.EPERM, "can not remove root directory", str(path))
+            os.rmdir(name, dir_fd=dir_fd)
+
+    @universal_exception
+    async def unlink(self, path: Path) -> None:
+        with self._open_parent(path) as (dir_fd, name):
+            if not name:
+                raise PermissionError(errno.EPERM, "can not unlink root directory", str(path))
+            os.unlink(name, dir_fd=dir_fd)
+
+    def list(self, path: Path) -> AsyncIterable[Path]:
+        path_io = self
+
+        class Lister(AbstractAsyncLister[Path]):
+            iter: Iterator[Path] | None = None
+
+            @universal_exception
+            async def __anext__(cls) -> Path:
+                if cls.iter is None:
+                    with path_io._walk(path_io._split_relative(path)) as fd:
+                        names = os.listdir(fd)
+                    cls.iter = iter(path / name for name in names)
+                try:
+                    return next(cls.iter)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        return Lister(timeout=self.timeout)
+
+    @universal_exception
+    async def stat(self, path: Path) -> stat_result:
+        return self._stat(path)
+
+    @universal_exception
+    async def _open(  # type: ignore[override]
+        self,
+        path: Path,
+        mode: "OpenBinaryMode" = "rb",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> io.BytesIO:
+        flags = {
+            "rb": os.O_RDONLY,
+            "wb": os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            "ab": os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            "r+b": os.O_RDWR,
+        }.get(mode)
+        if flags is None:
+            raise ValueError(f"invalid mode: {mode}")
+        fd = self._open_file(path, flags)
+        try:
+            return os.fdopen(  # type: ignore[return-value]
+                fd,
+                mode,
+                buffering=buffering,
+                encoding=encoding,
+                errors=errors,
+                newline=newline,
+            )
+        except Exception:
+            os.close(fd)
+            raise
+
+    @universal_exception
+    @defend_file_methods
+    async def seek(
+        self,
+        file: io.BytesIO,
+        offset: int,
+        whence: int = io.SEEK_SET,
+    ) -> int:
+        return file.seek(offset, whence)
+
+    @universal_exception
+    @defend_file_methods
+    async def write(self, file: io.BytesIO, s: "ReadableBuffer") -> int:
+        return file.write(s)
+
+    @universal_exception
+    @defend_file_methods
+    async def read(self, file: io.BytesIO, n: int = -1) -> bytes:
+        return file.read(n)
+
+    @universal_exception
+    @defend_file_methods
+    async def close(self, file: io.BytesIO) -> None:
+        return file.close()
+
+    @universal_exception
+    async def capture_rename_source(self, path: Path) -> _SecureRenameSource:
+        parts = self._split_relative(path)
+        with self._walk(parts[:-1]) as dir_fd:
+            if parts:
+                # O_PATH | O_NOFOLLOW pins the object itself, even if it is
+                # a symlink, without following or requiring any permissions
+                fd = os.open(parts[-1], os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+            else:
+                fd = os.open(os.curdir, os.O_PATH | os.O_CLOEXEC, dir_fd=dir_fd)
+        return _SecureRenameSource(Path(path), fd)
+
+    @universal_exception
+    async def rename(self, source: Path | _SecureRenameSource, destination: Path) -> Path:
+        if isinstance(source, _SecureRenameSource):
+            token: _SecureRenameSource | None = source
+            source_path = source.path
+        else:
+            token = None
+            source_path = source
+        try:
+            with self._open_parent(source_path) as (source_dir_fd, source_name):
+                if not source_name:
+                    raise PermissionError(errno.EPERM, "can not rename root directory", str(source_path))
+                with self._open_parent(destination) as (destination_dir_fd, destination_name):
+                    if not destination_name:
+                        raise PermissionError(errno.EPERM, "can not rename over root directory", str(destination))
+                    if token is not None and token.fd is not None:
+                        pinned = os.fstat(token.fd)
+                        current = os.stat(source_name, dir_fd=source_dir_fd, follow_symlinks=False)
+                        if (pinned.st_dev, pinned.st_ino) != (current.st_dev, current.st_ino):
+                            raise FileNotFoundError(
+                                errno.ENOENT,
+                                "rename source was replaced since RNFR",
+                                str(source_path),
+                            )
+                    os.rename(
+                        source_name,
+                        destination_name,
+                        src_dir_fd=source_dir_fd,
+                        dst_dir_fd=destination_dir_fd,
+                    )
+        finally:
+            if token is not None:
+                token.close()
+        return Path(destination)
 
 
 class Node:
