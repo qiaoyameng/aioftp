@@ -684,6 +684,9 @@ class Server:
     :type system_type: :py:class:`str`
     """
 
+    available_mlst_facts: tuple[str, ...] = ("Size", "Create", "Modify", "Type")
+    default_mlst_facts: tuple[str, ...] = available_mlst_facts
+
     def __init__(
         self,
         users: Sequence[User] | AbstractUserManager | None = None,
@@ -749,10 +752,12 @@ class Server:
             "cwd": self.cwd,
             "dele": self.dele,
             "epsv": self.epsv,
+            "feat": self.feat,
             "list": self.list,
             "mkd": self.mkd,
             "mlsd": self.mlsd,
             "mlst": self.mlst,
+            "opts": self.opts,
             "pass": self.pass_,
             "pasv": self.pasv,
             "pbsz": self.pbsz,
@@ -993,6 +998,7 @@ class Server:
             response=lambda *args: response_queue.put_nowait(args),
             acquired=False,
             restart_offset=0,
+            mlst_facts=self.default_mlst_facts,
             _dispatcher=asyncio.current_task(),
         )
         connection.path_io = self.path_io_factory(
@@ -1119,6 +1125,7 @@ class Server:
             await self.user_manager.notify_logout(connection.user)
         del connection.user
         del connection.logged
+        connection.mlst_facts = self.default_mlst_facts
         state, user, info = await self.user_manager.get_user(rest)
         if state == AbstractUserManager.GetUserResponse.OK:
             code = "230"
@@ -1164,6 +1171,39 @@ class Server:
     async def quit(self, connection: Connection, rest: str | PurePosixPath) -> bool:
         connection.response("221", "bye")
         return False
+
+    async def feat(self, connection: Connection, rest: str) -> bool:
+        facts = "".join(
+            name + ("*" if name in self.default_mlst_facts else "") + ";" for name in self.available_mlst_facts
+        )
+        connection.response("211", ["Features:", "MLST " + facts, "End"], True)
+        return True
+
+    async def opts(self, connection: Connection, rest: str) -> bool:
+        option, _, argument = rest.partition(" ")
+        if option.lower() != "mlst":
+            connection.response("502", f"option {option!r} not implemented")
+            return True
+        selected: list[str] = []
+        unknown: list[str] = []
+        for raw_name in argument.split(";"):
+            name = raw_name.strip()
+            if not name:
+                continue
+            for available in self.available_mlst_facts:
+                if name.lower() == available.lower():
+                    if available not in selected:
+                        selected.append(available)
+                    break
+            else:
+                unknown.append(name)
+        if unknown:
+            connection.response("501", "unknown mlst facts: " + ", ".join(unknown))
+            return True
+        connection.mlst_facts = tuple(selected)
+        applied = "".join(name + ";" for name in selected)
+        connection.response("200", "mlst facts selected: " + (applied or "<none>"))
+        return True
 
     @ConnectionConditions(ConnectionConditions.login_required)
     async def pwd(self, connection: Connection, rest: str | PurePosixPath) -> bool:
@@ -1220,21 +1260,30 @@ class Server:
         }
 
     async def build_mlsx_string(self, connection: Connection, path: Path) -> str:
-        if not await connection.path_io.exists(path):
-            facts: MLSXFacts = {}
-        else:
+        selected_facts = getattr(connection, "mlst_facts", None)
+        if selected_facts is None:
+            selected_facts = self.default_mlst_facts
+        facts: dict[str, Any] = {}
+        try:
             stats = await connection.path_io.stat(path)
-            facts = self._build_mlsx_facts_from_stats(stats)
-        if await connection.path_io.is_file(path):
-            facts["Type"] = "file"
-        elif await connection.path_io.is_dir(path):
-            facts["Type"] = "dir"
-        else:
-            facts["Type"] = "unknown"
+        except (OSError, errors.PathIOError):
+            stats = None
+        if stats is not None:
+            facts.update(self._build_mlsx_facts_from_stats(stats))
+        try:
+            if await connection.path_io.is_file(path):
+                facts["Type"] = "file"
+            elif await connection.path_io.is_dir(path):
+                facts["Type"] = "dir"
+            else:
+                facts["Type"] = "unknown"
+        except (OSError, errors.PathIOError):
+            pass
 
         s = ""
-        for name, value in facts.items():
-            s += f"{name}={value};"
+        for name in selected_facts:
+            if name in facts:
+                s += f"{name}={facts[name]};"
         s += " " + path.name
         return s
 

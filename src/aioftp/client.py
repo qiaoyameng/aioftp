@@ -6,7 +6,7 @@ import logging
 import re
 import ssl
 import sys
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Iterable, Sequence
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from types import TracebackType
@@ -693,9 +693,13 @@ class BaseClient:
         else:
             s = b
         line = s.rstrip()
-        facts_found, _, name = line.partition(" ")
+        facts_found, sep, name = line.partition(" ")
+        if not sep:
+            facts_found, name = "", facts_found
         entry = {}
         for fact in facts_found[:-1].split(";"):
+            if not fact:
+                continue
             key, _, value = fact.partition("=")
             entry[key.lower()] = value
         return PurePosixPath(name), entry  # type: ignore[return-value]
@@ -1026,6 +1030,36 @@ class Client(BaseClient):
                 Code("550"),
                 "path does not exists",
             )
+
+    async def feat(self) -> Sequence[str]:
+        """
+        :py:func:`asyncio.coroutine`
+
+        Getting server features via FEAT command.
+
+        :return: server response lines
+        :rtype: :py:class:`list` of :py:class:`str`
+        """
+        code, info = await self.command("FEAT", "211")
+        return info
+
+    async def set_mlst_facts(self, facts: Iterable[str] = ()) -> None:
+        """
+        :py:func:`asyncio.coroutine`
+
+        Selecting MLSx facts via OPTS MLST command. The selection is
+        connection-wide on server side and affects both MLST and MLSD
+        replies. Passing an empty iterable clears the selection.
+
+        :param facts: fact names to select (case-insensitive)
+        :type facts: :py:class:`collections.abc.Iterable` of :py:class:`str`
+        """
+        names = tuple(facts)
+        if names:
+            command = "OPTS MLST " + ";".join(names) + ";"
+        else:
+            command = "OPTS MLST"
+        await self.command(command, "200")
 
     async def is_file(self, path: PathLike) -> bool:
         """
