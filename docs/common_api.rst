@@ -16,6 +16,12 @@ Common API
     :members:
     :show-inheritance:
 
+.. autoclass:: aioftp.NVTASCIIEncoder
+    :members:
+
+.. autoclass:: aioftp.NVTASCIIDecoder
+    :members:
+
 .. autoclass:: aioftp.AsyncListerMixin
 
 .. autoclass:: aioftp.AbstractAsyncLister

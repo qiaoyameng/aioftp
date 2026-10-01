@@ -1,3 +1,11 @@
+unreleased
+-------------------
+- server: `TYPE A` now performs real text mode transfers with streaming NVT
+  newline conversion (CRLF and CR NUL) for both `STOR` and `RETR`, local
+  newline convention is a single `\n`
+- server: `REST` is rejected with `504` in ASCII mode, since the offset does
+  not map to a local file position
+
 0.28.3 (2026-09-19)
 -------------------
 - client `is_dir` should treat `cdir` and `pdir` as a directory too, according to RFC3659 (fixes #211)

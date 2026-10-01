@@ -20,6 +20,8 @@ from .common import (
     END_OF_LINE,
     HALF_OF_YEAR_IN_SECONDS,
     Connection,
+    NVTASCIIDecoder,
+    NVTASCIIEncoder,
     StreamIO,
     StreamThrottle,
     ThrottleStreamIO,
@@ -993,6 +995,7 @@ class Server:
             response=lambda *args: response_queue.put_nowait(args),
             acquired=False,
             restart_offset=0,
+            transfer_type="I",
             _dispatcher=asyncio.current_task(),
         )
         connection.path_io = self.path_io_factory(
@@ -1400,8 +1403,16 @@ class Server:
             async with file_out, stream:
                 if connection.restart_offset:
                     await file_out.seek(connection.restart_offset)
-                async for data in stream.iter_by_block(connection.block_size):
-                    await file_out.write(data)
+                if connection.transfer_type == "A":
+                    decoder = NVTASCIIDecoder()
+                    async for data in stream.iter_by_block(connection.block_size):
+                        await file_out.write(decoder.decode(data))
+                    tail = decoder.flush()
+                    if tail:
+                        await file_out.write(tail)
+                else:
+                    async for data in stream.iter_by_block(connection.block_size):
+                        await file_out.write(data)
             connection.response("226", "data transfer done")
             return True
 
@@ -1440,8 +1451,13 @@ class Server:
             async with file_in, stream:
                 if connection.restart_offset:
                     await file_in.seek(connection.restart_offset)
-                async for data in file_in.iter_by_block(connection.block_size):
-                    await stream.write(data)
+                if connection.transfer_type == "A":
+                    encoder = NVTASCIIEncoder()
+                    async for data in file_in.iter_by_block(connection.block_size):
+                        await stream.write(encoder.encode(data))
+                else:
+                    async for data in file_in.iter_by_block(connection.block_size):
+                        await stream.write(data)
             connection.response("226", "data transfer done")
             return True
 
@@ -1613,8 +1629,14 @@ class Server:
 
     async def rest(self, connection: Connection, rest: str) -> bool:
         if rest.isdigit():
-            connection.restart_offset = int(rest)
-            connection.response("350", f"restarting at {rest}")
+            if connection.transfer_type == "A":
+                # In ASCII mode the restart offset refers to the NVT-encoded
+                # byte stream, which does not map to a local file position.
+                connection.restart_offset = 0
+                connection.response("504", "restart not implemented for ASCII type")
+            else:
+                connection.restart_offset = int(rest)
+                connection.response("350", f"restarting at {rest}")
         else:
             connection.restart_offset = 0
             message = f"syntax error, can't restart at {rest!r}"

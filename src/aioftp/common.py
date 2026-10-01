@@ -24,6 +24,9 @@ __all__ = (
     "StreamThrottle",
     "ThrottleStreamIO",
     "END_OF_LINE",
+    "LOCAL_END_OF_LINE",
+    "NVTASCIIEncoder",
+    "NVTASCIIDecoder",
     "DEFAULT_BLOCK_SIZE",
     "wrap_with_container",
     "AsyncStreamIterator",
@@ -42,6 +45,10 @@ __all__ = (
 )
 
 END_OF_LINE = "\r\n"
+#: Local newline convention of the server file storage. Text files are
+#: stored with a single ``\n`` as the line separator, so any ``\r`` byte
+#: in a local file is data, never part of a line ending.
+LOCAL_END_OF_LINE = b"\n"
 DEFAULT_BLOCK_SIZE = 8192
 
 DEFAULT_PORT = 21
@@ -50,6 +57,62 @@ DEFAULT_PASSWORD = "anon@"
 DEFAULT_ACCOUNT = ""
 HALF_OF_YEAR_IN_SECONDS = 15778476
 TWO_YEARS_IN_SECONDS = ((365 * 3 + 366) * 24 * 60 * 60) / 2
+
+
+class NVTASCIIEncoder:
+    """
+    Streaming converter from the local text representation to NVT ASCII
+    (RFC 959) for ``TYPE A`` transfers.
+
+    The local newline is a single ``\\n`` (see ``LOCAL_END_OF_LINE``), so
+    every local ``\\n`` becomes CRLF on the wire and every local ``\\r``
+    is data and gets escaped as CR NUL.
+
+    Works purely on bytes, never decoding text per block, so multi-byte
+    characters split across blocks can not be corrupted. The conversion is
+    stateless, ``flush()`` is provided for symmetry with
+    :py:class:`NVTASCIIDecoder` and always returns an empty bytes object.
+    """
+
+    def encode(self, data: bytes) -> bytes:
+        return data.replace(b"\r", b"\r\x00").replace(b"\n", b"\r\n")
+
+    def flush(self) -> bytes:
+        return b""
+
+
+class NVTASCIIDecoder:
+    """
+    Streaming converter from NVT ASCII (RFC 959) to the local text
+    representation for ``TYPE A`` transfers.
+
+    CRLF becomes the local newline (see ``LOCAL_END_OF_LINE``) and CR NUL
+    becomes a bare ``\\r``. A CR may arrive as the last byte of a block
+    with the following byte (LF or NUL) in the next block, so the decoder
+    keeps one byte of state between ``decode()`` calls. Call ``flush()``
+    at the end of the stream to emit a trailing bare CR.
+
+    Works purely on bytes, never decoding text per block, so multi-byte
+    characters split across blocks can not be corrupted.
+    """
+
+    def __init__(self) -> None:
+        self._pending_cr = False
+
+    def decode(self, data: bytes) -> bytes:
+        if self._pending_cr:
+            data = b"\r" + data
+            self._pending_cr = False
+        if data.endswith(b"\r"):
+            data = data[:-1]
+            self._pending_cr = True
+        return data.replace(b"\r\n", LOCAL_END_OF_LINE).replace(b"\r\x00", b"\r")
+
+    def flush(self) -> bytes:
+        if self._pending_cr:
+            self._pending_cr = False
+            return b"\r"
+        return b""
 
 
 def _now() -> float:
