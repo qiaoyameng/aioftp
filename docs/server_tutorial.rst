@@ -118,6 +118,26 @@ Second one via user class
     >>> users = (aioftp.User(maximum_connections=3),)
     >>> server = aioftp.Server(users)
 
+TLS upgrade
+-----------
+
+To serve explicit FTP over TLS, keep the command listener plain and provide a
+server-side SSL context with `ssl_context`. `AUTH TLS` upgrades only the
+command connection; `PBSZ 0` and `PROT P` then enable TLS for passive data
+connections. `PROT C` applies to data connections established later and does
+not downgrade the command connection. Pipelined commands already buffered
+before the TLS handshake are rejected and the command connection is closed;
+commands must wait until the handshake and security negotiation complete.
+
+::
+
+    >>> server = aioftp.Server(
+    ...     ssl_context=server_ssl_context,
+    ...     require_tls=True,
+    ... )
+    >>> await server.start()
+
+
 Throttle
 --------
 

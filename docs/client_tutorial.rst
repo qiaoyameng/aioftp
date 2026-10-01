@@ -389,6 +389,11 @@ client, like:
     >>> await client.upgrade_to_tls()
     >>> await client.login("user", "pass")
 
+`upgrade_to_tls` negotiates `PBSZ 0` and `PROT P`, so passive data
+connections are encrypted by default. Call :py:meth:`aioftp.Client.prot_c`
+to leave later data connections clear and :py:meth:`aioftp.Client.prot_p`
+to encrypt them again.
+
 Using proxy
 -----------
 

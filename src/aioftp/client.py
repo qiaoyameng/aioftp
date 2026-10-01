@@ -215,6 +215,9 @@ class BaseClient:
         self.encoding = encoding
         self._stream: ThrottleStreamIO | None = None
         self.ssl = ssl
+        self._tls_upgraded = False
+        self._pbsz_done = bool(ssl)
+        self._data_ssl = ssl
         self.parse_list_line_custom = parse_list_line_custom
         self.parse_list_line_custom_first = parse_list_line_custom_first
         self._passive_commands = passive_commands
@@ -222,8 +225,8 @@ class BaseClient:
         self._siosocks_asyncio_kwargs = siosocks_asyncio_kwargs
 
     async def _open_connection(self, host: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        ssl_resolved = self.ssl
-        if self._stream is not None:
+        ssl_resolved = self._data_ssl
+        if ssl_resolved and self._stream is not None:
             ssl_object = self._stream.writer.transport.get_extra_info("ssl_object")
             if ssl_object is not None:
                 ssl_resolved = SSLSessionBoundContext(
@@ -775,8 +778,43 @@ class Client(BaseClient):
 
         Sends the PBSZ and PROT commands as required for TLS connection.
         """
-        await self.command("PBSZ 0", "200")
-        await self.command("PROT P", "200")
+        await self.pbsz()
+        await self.prot_p()
+
+    async def pbsz(self) -> None:
+        """
+        :py:func:`asyncio.coroutine`
+
+        Negotiate the TLS protection buffer size. This is required after
+        `AUTH TLS` before selecting data connection protection with `PROT`.
+        """
+        if not self._tls_upgraded:
+            raise RuntimeError("TLS must be negotiated with AUTH before PBSZ")
+        if not self._pbsz_done:
+            await self.command("PBSZ 0", "200")
+            self._pbsz_done = True
+
+    async def prot(self, level: str = "P") -> None:
+        """
+        :py:func:`asyncio.coroutine`
+
+        Select protection for data connections established after this command.
+        `P` encrypts future data connections and `C` leaves them clear.
+        """
+        level = level.upper()
+        if level not in ("P", "C"):
+            raise ValueError("PROT level must be 'P' or 'C'")
+        await self.pbsz()
+        await self.command(f"PROT {level}", "200")
+        self._data_ssl = self.ssl if level == "P" else None
+
+    async def prot_p(self) -> None:
+        """Protect future data connections with TLS."""
+        await self.prot("P")
+
+    async def prot_c(self) -> None:
+        """Leave future data connections unencrypted."""
+        await self.prot("C")
 
     async def upgrade_to_tls(self, sslcontext: ssl.SSLContext | None = None) -> None:
         """
@@ -791,13 +829,15 @@ class Client(BaseClient):
         :param sslcontext: custom ssl context
         :type sslcontext: :py:class:`ssl.SSLContext`
         """
-        if self.ssl:
+        if self.ssl or self._tls_upgraded:
             raise RuntimeError("ssl context is already set and used implicitly")
 
         await self.command("AUTH TLS", "234")
         if sslcontext is None:
             sslcontext = ssl.create_default_context()
         await self.stream.start_tls(sslcontext=sslcontext, server_hostname=self.server_host)
+        self._tls_upgraded = True
+        self.ssl = sslcontext
         await self._send_tls_protection_commands()
 
     async def login(

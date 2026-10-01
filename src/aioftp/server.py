@@ -12,7 +12,7 @@ import sys
 import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, TypedDict, TypeVar
+from typing import Any, Literal, TypedDict, TypeVar, cast
 
 from . import errors, pathio
 from .common import (
@@ -594,6 +594,7 @@ class AsyncIOStartServerKwargs(TypedDict, total=False):
     loop: asyncio.events.AbstractEventLoop | None
     limit: int
     ssl_handshake_timeout: float | None
+    ssl_shutdown_timeout: float | None
     family: int
     flags: int
     sock: None
@@ -677,6 +678,14 @@ class Server:
         Please look :py:meth:`asyncio.loop.create_server` docs.
     :type ssl: :py:class:`ssl.SSLContext`
 
+    :param ssl_context: SSL context used to upgrade plain command
+        connections after `AUTH TLS`. The listening socket remains plain.
+    :type ssl_context: :py:class:`ssl.SSLContext`
+
+    :param require_tls: reject login on command connections which have not
+        negotiated TLS
+    :type require_tls: :py:class:`bool`
+
     :param welcome_message: welcome message for new connections
     :type welcome_message: :py:class:`str`
 
@@ -703,6 +712,8 @@ class Server:
         data_ports: Iterable[int] | None = None,
         encoding: str = "utf-8",
         ssl: ssl.SSLContext | None = None,
+        ssl_context: ssl.SSLContext | None = None,
+        require_tls: bool = False,
         welcome_message: str = "welcome",
         system_type: str = "UNIX Type: L8",
     ) -> None:
@@ -737,6 +748,8 @@ class Server:
         self.throttle_per_user: dict[User | None, StreamThrottle] = {}
         self.encoding = encoding
         self.ssl = ssl
+        self.ssl_context = ssl_context
+        self.require_tls = require_tls
         self.welcome_message = welcome_message
         self.system_type = system_type
         self.commands_mapping: dict[
@@ -745,6 +758,7 @@ class Server:
         ] = {
             "abor": self.abor,
             "appe": self.appe,
+            "auth": self.auth,
             "cdup": self.cdup,
             "cwd": self.cwd,
             "dele": self.dele,
@@ -790,7 +804,18 @@ class Server:
         :param kwargs: keyword arguments, they passed to
             :py:func:`asyncio.start_server`
         """
-        self._start_server_extra_arguments = kwargs
+        start_server_extra_arguments = cast(AsyncIOStartServerKwargs, dict(kwargs))
+        self._ssl_handshake_timeout = (
+            start_server_extra_arguments.get("ssl_handshake_timeout")
+            if self.ssl is not None
+            else start_server_extra_arguments.pop("ssl_handshake_timeout", None)
+        )
+        if self.ssl is None:
+            start_server_extra_arguments["ssl"] = None
+            start_server_extra_arguments.pop("ssl_shutdown_timeout", None)
+        else:
+            start_server_extra_arguments["ssl"] = self.ssl
+        self._start_server_extra_arguments = start_server_extra_arguments
         self.connections: dict[StreamIO, Connection] = {}
         self.server_host = host
         self.server_port = port
@@ -798,7 +823,6 @@ class Server:
             self.dispatcher,
             host,
             port,
-            ssl=self.ssl,
             **self._start_server_extra_arguments,
         )
         for sock in self.server.sockets:
@@ -976,6 +1000,7 @@ class Server:
             write_timeout=self.socket_timeout,
         )
         response_queue: asyncio.Queue[Any] = asyncio.Queue()
+        control_ssl = stream.writer.transport.get_extra_info("ssl_object") is not None
         connection = Connection(
             client_host=host,
             client_port=port,
@@ -983,6 +1008,10 @@ class Server:
             passive_server_port=0,
             server_port=self.server_port,
             command_connection=stream,
+            response_queue=response_queue,
+            control_ssl=control_ssl,
+            data_ssl=self.ssl,
+            pbsz_done=control_ssl,
             socket_timeout=self.socket_timeout,
             idle_timeout=self.idle_timeout,
             wait_future_timeout=self.wait_future_timeout,
@@ -999,11 +1028,14 @@ class Server:
             timeout=self.path_timeout,
             connection=connection,
         )
-        pending = {
+        pending: set[asyncio.Task[Any]] = {
             asyncio.create_task(self.greeting(connection, "")),
             asyncio.create_task(self.response_writer(stream, response_queue)),
-            asyncio.create_task(self.parse_command(stream)),
         }
+        parse_task: asyncio.Task[Any] | None = asyncio.create_task(self.parse_command(stream))
+        assert parse_task is not None
+        pending.add(parse_task)
+        command_task: asyncio.Task[Any] | None = None
         self.connections[key] = connection
         try:
             while True:
@@ -1020,25 +1052,30 @@ class Server:
                         continue
                     # this is "command" result
                     if isinstance(result, bool):
+                        if task is command_task:
+                            command_task = None
+                            parse_task = asyncio.create_task(self.parse_command(stream))
+                            assert parse_task is not None
+                            pending.add(parse_task)
                         if not result:
                             await response_queue.join()
                             return
                     # this is parse_command result
                     elif isinstance(result, tuple):
-                        pending.add(
-                            asyncio.create_task(self.parse_command(stream)),
-                        )
+                        parse_task = None
                         cmd, rest = result
                         f = self.commands_mapping.get(cmd)
                         if f is not None:
-                            pending.add(
-                                asyncio.create_task(f(connection, rest)),  # type: ignore[arg-type]
-                            )
+                            command_task = asyncio.create_task(f(connection, rest))  # type: ignore[arg-type]
+                            pending.add(command_task)
                             if cmd not in ("retr", "stor", "appe"):
                                 connection.restart_offset = 0
                         else:
                             message = f"{cmd!r} not implemented"
                             connection.response("502", message)
+                            parse_task = asyncio.create_task(self.parse_command(stream))
+                            assert parse_task is not None
+                            pending.add(parse_task)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1052,12 +1089,16 @@ class Server:
                     tasks_to_wait.append(task)
                 if connection.future.passive_server.done():
                     connection.passive_server.close()
+                    tasks_to_wait.append(
+                        asyncio.create_task(connection.passive_server.wait_closed()),
+                    )
                     if self.available_data_ports is not None:
                         port = connection.passive_server_port
                         self.available_data_ports.put_nowait((0, port))
                 if connection.future.data_connection.done():
                     connection.data_connection.close()
                 stream.close()
+                tasks_to_wait.append(asyncio.create_task(stream.wait_closed()))
             if connection.acquired:
                 self.available_connections.release()
             if connection.future.user.done():
@@ -1114,7 +1155,53 @@ class Server:
         connection.response(code, info)
         return ok
 
+    @staticmethod
+    def _has_unread_command_bytes(stream: StreamIO) -> bool:
+        buffer = getattr(stream.reader, "_buffer", None)
+        return bool(buffer)
+
+    async def auth(self, connection: Connection, rest: str | PurePosixPath) -> bool:
+        if connection.control_ssl:
+            connection.response("503", "AUTH already negotiated")
+            return True
+        if self.ssl_context is None:
+            connection.response("502", "AUTH TLS not supported")
+            return True
+        if str(rest).upper() not in ("TLS", "SSL"):
+            connection.response("504", "authentication mechanism not supported")
+            return True
+        if self._has_unread_command_bytes(connection.command_connection):
+            connection.response("503", "commands are already buffered before TLS handshake")
+            return True
+
+        connection.response("234", "security negotiation ready")
+        await connection.response_queue.join()
+        try:
+            await connection.command_connection.start_tls(
+                sslcontext=self.ssl_context,
+                server_hostname=None,
+                ssl_handshake_timeout=self._ssl_handshake_timeout,
+            )
+        except (ssl.SSLError, OSError, asyncio.TimeoutError):
+            logger.info("TLS handshake failed", exc_info=True)
+            return False
+        connection.control_ssl = True
+        return True
+
+    async def _close_passive_server(self, connection: Connection) -> None:
+        if not connection.future.passive_server.done():
+            return
+        connection.passive_server.close()
+        await connection.passive_server.wait_closed()
+        if self.available_data_ports is not None:
+            self.available_data_ports.put_nowait((0, connection.passive_server_port))
+        del connection.passive_server
+        connection.passive_server_port = 0
+
     async def user(self, connection: Connection, rest: str) -> bool:
+        if self.require_tls and not connection.control_ssl:
+            connection.response("534", "TLS required")
+            return True
         if connection.future.user.done():
             await self.user_manager.notify_logout(connection.user)
         del connection.user
@@ -1151,6 +1238,9 @@ class Server:
 
     @ConnectionConditions(ConnectionConditions.user_required)
     async def pass_(self, connection: Connection, rest: str) -> bool:
+        if self.require_tls and not connection.control_ssl:
+            connection.response("534", "TLS required")
+            return True
         if connection.future.logged.done():
             code, info = "503", "already logged in"
         elif await self.user_manager.authenticate(connection.user, rest):
@@ -1462,18 +1552,30 @@ class Server:
         connection.response(code, info)
         return True
 
-    @ConnectionConditions(ConnectionConditions.login_required)
     async def pbsz(self, connection: Connection, rest: str | PurePosixPath) -> bool:
-        connection.response("200", "")
+        if not connection.control_ssl:
+            connection.response("503", "TLS required")
+        elif rest != "0":
+            connection.response("501", "PBSZ must be 0")
+        else:
+            connection.pbsz_done = True
+            connection.response("200", "")
         return True
 
-    @ConnectionConditions(ConnectionConditions.login_required)
     async def prot(self, connection: Connection, rest: str | PurePosixPath) -> bool:
-        if rest == "P":
-            code, info = "200", ""
+        if not connection.control_ssl:
+            connection.response("503", "TLS required")
+        elif not connection.pbsz_done:
+            connection.response("503", "PBSZ required")
+        elif rest not in ("P", "C"):
+            connection.response("502", f"PROT {rest} not implemented")
         else:
-            code, info = "502", ""
-        connection.response(code, info)
+            data_ssl = (self.ssl if self.ssl is not None else self.ssl_context) if rest == "P" else None
+            if connection.future.passive_server.done() and connection.data_ssl is not data_ssl:
+                await self._close_passive_server(connection)
+            connection.data_ssl = data_ssl
+            code, info = "200", ""
+            connection.response(code, info)
         return True
 
     async def _start_passive_server(
@@ -1481,6 +1583,16 @@ class Server:
         connection: Connection,
         handler_callback: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]],
     ) -> asyncio.Server:
+        extra_arguments = cast(
+            AsyncIOStartServerKwargs,
+            dict(self._start_server_extra_arguments),
+        )
+        if connection.data_ssl is None:
+            extra_arguments["ssl"] = None
+            extra_arguments.pop("ssl_handshake_timeout", None)
+            extra_arguments.pop("ssl_shutdown_timeout", None)
+        else:
+            extra_arguments["ssl"] = connection.data_ssl
         if self.available_data_ports is not None:
             viewed_ports = set()
             while True:
@@ -1493,8 +1605,7 @@ class Server:
                         handler_callback,
                         connection.server_host,
                         port,
-                        ssl=self.ssl,
-                        **self._start_server_extra_arguments,
+                        **extra_arguments,
                     )
                     connection.passive_server_port = port
                     break
@@ -1509,8 +1620,7 @@ class Server:
                 handler_callback,
                 connection.server_host,
                 connection.passive_server_port,
-                ssl=self.ssl,
-                **self._start_server_extra_arguments,
+                **extra_arguments,
             )
         return passive_server
 

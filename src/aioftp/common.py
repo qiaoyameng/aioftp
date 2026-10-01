@@ -445,14 +445,25 @@ class StreamIO:
         """
         self.writer.close()
 
-    async def start_tls(self, sslcontext: ssl.SSLContext, server_hostname: str | None) -> None:
+    async def wait_closed(self) -> None:
+        """
+        Wait until the connection is closed.
+        """
+        await self.writer.wait_closed()
+
+    async def start_tls(
+        self,
+        sslcontext: ssl.SSLContext,
+        server_hostname: str | None,
+        ssl_handshake_timeout: float | int | None = None,
+    ) -> None:
         """
         Upgrades the connection to TLS
         """
         await self.writer.start_tls(  # type: ignore[attr-defined,unused-ignore]  # py3.12+
             sslcontext=sslcontext,
             server_hostname=server_hostname,
-            ssl_handshake_timeout=self.write_timeout,
+            ssl_handshake_timeout=ssl_handshake_timeout or self.write_timeout,
         )
 
 
