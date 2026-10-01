@@ -1,3 +1,13 @@
+master
+------
+- add Linux-only `SecurePathIO` backend: path resolution, open, remove and
+  rename are performed relative to directory descriptors, so path components
+  can not be swapped for symlinks to escape the FTP root; symlink handling
+  inside the root is explicitly controlled by the `allow_symlinks` option
+- server `RNFR` now captures the rename source object via
+  `AbstractPathIO.acquire_rename_source`, so `SecurePathIO` detects when the
+  source object was replaced between `RNFR` and `RNTO`
+
 0.28.3 (2026-09-19)
 -------------------
 - client `is_dir` should treat `cdir` and `pdir` as a directory too, according to RFC3659 (fixes #211)

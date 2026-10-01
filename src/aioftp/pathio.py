@@ -1,8 +1,11 @@
 import abc
 import asyncio
+import contextlib
+import errno
 import functools
 import io
 import operator
+import os
 import stat
 import sys
 import time
@@ -49,6 +52,7 @@ __all__ = (
     "AsyncPathIO",
     "MemoryPathIO",
     "PathIONursery",
+    "SecurePathIO",
 )
 
 
@@ -483,6 +487,25 @@ class AbstractPathIO(Generic[PathType], abc.ABC):
         :type destination: :py:class:`pathlib.Path`
         """
 
+    @universal_exception
+    async def acquire_rename_source(self, path: PathType) -> Any:
+        """
+        :py:func:`asyncio.coroutine`
+
+        Capture the rename source for a subsequent
+        :py:meth:`aioftp.AbstractPathIO.rename` call. The default
+        implementation returns the path itself. Backends may return an
+        opaque token which pins the source object, so that changes of the
+        source object between RNFR and RNTO can be detected.
+
+        :param path: path to capture
+        :type path: :py:class:`pathlib.Path`
+
+        :return: opaque token accepted by
+            :py:meth:`aioftp.AbstractPathIO.rename` as `source`
+        """
+        return path
+
 
 class PathIO(AbstractPathIO[Path]):
     """
@@ -748,6 +771,421 @@ class AsyncPathIO(AbstractPathIO[Path]):
     @_blocking_io
     def rename(self, source: Path, destination: Path) -> Path:
         return source.rename(destination)
+
+
+class _RenameSource:
+    """
+    Opaque token produced by :py:meth:`aioftp.SecurePathIO.acquire_rename_source`.
+    Pins the source object with an ``O_PATH`` file descriptor, so the object
+    identity can be verified when the rename is finally performed.
+    """
+
+    __slots__ = ("path", "fd", "_closed")
+
+    def __init__(self, path: Path, fd: int) -> None:
+        self.path = path
+        self.fd = fd
+        self._closed = False
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            os.close(self.fd)
+
+    def __del__(self) -> None:
+        self.close()
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(path={self.path!r}, fd={self.fd!r})"
+
+
+class SecurePathIO(AbstractPathIO[Path]):
+    """
+    Blocking path io with symlink-race protection, available on Linux only.
+
+    All paths are resolved component by component starting from a directory
+    file descriptor of `root` (``openat``-style), so a path component can
+    not be swapped for a symlink to escape the root between the path check
+    and the actual operation. Opening, removing and renaming are performed
+    relative to resolved directory descriptors.
+
+    :param root: root directory, all paths are confined to it
+    :type root: :py:class:`pathlib.Path` or :py:class:`str`
+
+    :param allow_symlinks: allow symlinks inside `root`. Symlink targets
+        are resolved safely and must stay inside `root`. If `False`
+        (default), any symlink in a path is rejected.
+    :type allow_symlinks: :py:class:`bool`
+
+    Usage with a server:
+    ::
+
+        >>> import functools
+        >>> aioftp.Server(
+        ...     path_io_factory=functools.partial(aioftp.SecurePathIO, root="/srv/ftp"),
+        ... )
+    """
+
+    max_symlinks = 40
+
+    def __init__(
+        self,
+        timeout: float | int | None = None,
+        connection: Connection | None = None,
+        state: list["Node"] | None = None,
+        *,
+        root: str | Path = ".",
+        allow_symlinks: bool = False,
+    ) -> None:
+        super().__init__(timeout, connection, state)
+        missing = self.missing_capabilities()
+        if missing:
+            raise NotImplementedError(
+                "SecurePathIO is not supported on this platform, missing capabilities: " + ", ".join(missing),
+            )
+        self.root = Path(root)
+        self.allow_symlinks = allow_symlinks
+
+    @classmethod
+    def missing_capabilities(cls) -> tuple[str, ...]:
+        """
+        Return a tuple of missing platform capabilities required by
+        :py:class:`aioftp.SecurePathIO`. Empty tuple means the backend is
+        fully supported.
+        """
+        missing = []
+        if not sys.platform.startswith("linux"):
+            missing.append("linux")
+        for f in (os.open, os.stat, os.mkdir, os.unlink, os.rmdir, os.rename, os.readlink):
+            if f not in os.supports_dir_fd:
+                missing.append(f"{f.__name__}(dir_fd)")
+        if os.stat not in os.supports_follow_symlinks:
+            missing.append("stat(follow_symlinks)")
+        for flag in ("O_DIRECTORY", "O_NOFOLLOW", "O_PATH", "O_CLOEXEC"):
+            if not hasattr(os, flag):
+                missing.append(f"os.{flag}")
+        return tuple(missing)
+
+    @classmethod
+    def is_supported(cls) -> bool:
+        """
+        Check if the current platform provides everything
+        :py:class:`aioftp.SecurePathIO` needs.
+        """
+        return not cls.missing_capabilities()
+
+    def _resolve(self, path: Path, *, follow_final: bool) -> tuple[list[int], str | None]:
+        """
+        Resolve `path` component by component below the root directory
+        descriptor. Returns a tuple of a list of owned file descriptors
+        (the caller must close them) and the final component name (`None`
+        if `path` denotes the root itself). The last descriptor in the
+        list is the directory the final component belongs to.
+        """
+        relative = Path(path).relative_to(self.root)
+        parts = list(relative.parts)
+        fds = [os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)]
+        symlinks = 0
+        try:
+            while parts:
+                name = parts.pop(0)
+                if name in ("", "."):
+                    continue
+                if name == "..":
+                    # can not escape the root
+                    if len(fds) > 1:
+                        os.close(fds.pop())
+                    continue
+                last = not parts
+                try:
+                    st = os.stat(name, dir_fd=fds[-1], follow_symlinks=False)
+                except FileNotFoundError:
+                    if last:
+                        # the final component may not exist yet (O_CREAT,
+                        # rename destination, etc.)
+                        return fds, name
+                    raise
+                if stat.S_ISLNK(st.st_mode):
+                    if last and not follow_final:
+                        return fds, name
+                    if not self.allow_symlinks:
+                        raise PermissionError(
+                            errno.EACCES,
+                            "symlinks are not allowed",
+                            name,
+                        )
+                    symlinks += 1
+                    if symlinks > self.max_symlinks:
+                        raise OSError(errno.ELOOP, "too many levels of symbolic links", name)
+                    target = os.readlink(name, dir_fd=fds[-1])
+                    if os.path.isabs(target):
+                        while len(fds) > 1:
+                            os.close(fds.pop())
+                    # ".." components are clamped to the root on next
+                    # iterations, so the target can not escape the root
+                    parts = [p for p in PurePosixPath(target).parts if p != "/"] + parts
+                elif stat.S_ISDIR(st.st_mode):
+                    if last:
+                        return fds, name
+                    fd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=fds[-1],
+                    )
+                    fds.append(fd)
+                else:
+                    if last:
+                        return fds, name
+                    raise NotADirectoryError(
+                        errno.ENOTDIR,
+                        "not a directory",
+                        name,
+                    )
+            return fds, None
+        except BaseException:
+            for fd in fds:
+                os.close(fd)
+            raise
+
+    @contextlib.contextmanager
+    def _resolved(self, path: Path, *, follow_final: bool = False) -> Generator[tuple[int, str | None], None, None]:
+        """
+        Context manager. Yields ``(dir_fd, name)`` for `path`, where `name`
+        is the final component (`None` for the root itself) and `dir_fd`
+        is the descriptor of the directory it belongs to.
+        """
+        fds, name = self._resolve(path, follow_final=follow_final)
+        try:
+            yield fds[-1], name
+        finally:
+            for fd in fds:
+                os.close(fd)
+
+    @contextlib.contextmanager
+    def _resolved_parent(self, path: Path) -> Generator[tuple[int, str], None, None]:
+        """
+        Context manager. Yields ``(dir_fd, name)`` for the parent directory
+        of `path` and its final component. The parent is resolved with
+        symlink following according to the `allow_symlinks` policy.
+        """
+        path = Path(path)
+        with self._resolved(path.parent, follow_final=True) as (dir_fd, name):
+            if name is not None:
+                dir_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=dir_fd,
+                )
+                try:
+                    yield dir_fd, path.name
+                finally:
+                    os.close(dir_fd)
+            else:
+                yield dir_fd, path.name
+
+    def _stat(self, path: Path, *, follow: bool) -> stat_result:
+        with self._resolved(path, follow_final=follow) as (dir_fd, name):
+            if name is None:
+                return os.stat(dir_fd)
+            return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+
+    @universal_exception
+    async def exists(self, path: Path) -> bool:
+        try:
+            self._stat(path, follow=False)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        return True
+
+    @universal_exception
+    async def is_dir(self, path: Path) -> bool:
+        try:
+            st = self._stat(path, follow=self.allow_symlinks)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        return stat.S_ISDIR(st.st_mode)
+
+    @universal_exception
+    async def is_file(self, path: Path) -> bool:
+        try:
+            st = self._stat(path, follow=self.allow_symlinks)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        return stat.S_ISREG(st.st_mode)
+
+    @universal_exception
+    async def mkdir(self, path: Path, *, parents: bool = False, exist_ok: bool = False) -> None:
+        if parents:
+            relative = Path(path).relative_to(self.root)
+            current = self.root
+            for index, part in enumerate(relative.parts):
+                last = index == len(relative.parts) - 1
+                current /= part
+                with self._resolved_parent(current) as (dir_fd, name):
+                    try:
+                        os.mkdir(name, dir_fd=dir_fd)
+                    except FileExistsError:
+                        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                        if not stat.S_ISDIR(st.st_mode):
+                            raise FileExistsError(errno.EEXIST, "file exists", str(current))
+                        if last and not exist_ok:
+                            raise
+        else:
+            with self._resolved_parent(path) as (dir_fd, name):
+                os.mkdir(name, dir_fd=dir_fd)
+
+    @universal_exception
+    async def rmdir(self, path: Path) -> None:
+        with self._resolved_parent(path) as (dir_fd, name):
+            os.rmdir(name, dir_fd=dir_fd)
+
+    @universal_exception
+    async def unlink(self, path: Path) -> None:
+        with self._resolved_parent(path) as (dir_fd, name):
+            os.unlink(name, dir_fd=dir_fd)
+
+    def list(self, path: Path) -> AsyncIterable[Path]:
+        pathio = self
+
+        class Lister(AbstractAsyncLister[Path]):
+            iter: Iterator[str] | None = None
+
+            @universal_exception
+            async def __anext__(self) -> Path:
+                if self.iter is None:
+                    with pathio._resolved(path, follow_final=pathio.allow_symlinks) as (dir_fd, name):
+                        if name is not None:
+                            fd = os.open(
+                                name,
+                                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                dir_fd=dir_fd,
+                            )
+                        else:
+                            fd = os.dup(dir_fd)
+                        try:
+                            names = os.listdir(fd)
+                        finally:
+                            os.close(fd)
+                    self.iter = iter(names)
+                try:
+                    return path / next(self.iter)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        return Lister(timeout=self.timeout)
+
+    @universal_exception
+    async def stat(self, path: Path) -> stat_result:
+        return self._stat(path, follow=self.allow_symlinks)
+
+    @universal_exception
+    async def _open(  # type: ignore[override]
+        self,
+        path: Path,
+        mode: "OpenBinaryMode" = "rb",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> io.BytesIO:
+        flags = {
+            "rb": os.O_RDONLY,
+            "wb": os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            "ab": os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            "r+b": os.O_RDWR,
+        }[mode]
+        with self._resolved(path, follow_final=self.allow_symlinks) as (dir_fd, name):
+            if name is None:
+                raise IsADirectoryError(errno.EISDIR, "is a directory", str(path))
+            fd = os.open(
+                name,
+                flags | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=dir_fd,
+                mode=0o666,
+            )
+        return os.fdopen(  # type: ignore[return-value]
+            fd,
+            mode,
+            buffering=buffering,
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+        )
+
+    @universal_exception
+    @defend_file_methods
+    async def seek(
+        self,
+        file: io.BytesIO,
+        offset: int,
+        whence: int = io.SEEK_SET,
+    ) -> int:
+        return file.seek(offset, whence)
+
+    @universal_exception
+    @defend_file_methods
+    async def write(self, file: io.BytesIO, s: "ReadableBuffer") -> int:
+        return file.write(s)
+
+    @universal_exception
+    @defend_file_methods
+    async def read(self, file: io.BytesIO, n: int = -1) -> bytes:
+        return file.read(n)
+
+    @universal_exception
+    @defend_file_methods
+    async def close(self, file: io.BytesIO) -> None:
+        return file.close()
+
+    @universal_exception
+    async def acquire_rename_source(self, path: Path) -> _RenameSource:
+        with self._resolved_parent(path) as (dir_fd, name):
+            fd = os.open(
+                name,
+                os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=dir_fd,
+            )
+        return _RenameSource(Path(path), fd)
+
+    @universal_exception
+    async def rename(self, source: Path | _RenameSource, destination: Path) -> Path:
+        if isinstance(source, _RenameSource):
+            token: _RenameSource | None = source
+            source_path = source.path
+        else:
+            token = None
+            source_path = source
+        try:
+            with (
+                self._resolved_parent(source_path) as (source_fd, source_name),
+                self._resolved_parent(destination) as (
+                    destination_fd,
+                    destination_name,
+                ),
+            ):
+                if token is not None:
+                    pinned = os.fstat(token.fd)
+                    current = os.stat(
+                        source_name,
+                        dir_fd=source_fd,
+                        follow_symlinks=False,
+                    )
+                    if (pinned.st_dev, pinned.st_ino) != (current.st_dev, current.st_ino):
+                        raise OSError(
+                            errno.ESTALE,
+                            "rename source changed since it was captured",
+                            str(source_path),
+                        )
+                os.rename(
+                    source_name,
+                    destination_name,
+                    src_dir_fd=source_fd,
+                    dst_dir_fd=destination_fd,
+                )
+        finally:
+            if token is not None:
+                token.close()
+        return Path(destination)
 
 
 class Node:

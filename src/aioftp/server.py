@@ -1346,7 +1346,7 @@ class Server:
     @PathPermissions(PathPermissions.writable)
     async def rnfr(self, connection: Connection, rest: str | PurePosixPath) -> bool:
         real_path, virtual_path = self.get_paths(connection, rest)
-        connection.rename_from = real_path
+        connection.rename_from = await connection.path_io.acquire_rename_source(real_path)
         connection.response("350", "rename from accepted")
         return True
 
