@@ -214,6 +214,14 @@ need some abstraction layer for filesystem operations. That is why pathio
 exists. If you want to create your own pathio, then you should inherit
 :py:class:`aioftp.AbstractPathIO` and override it methods.
 
+To support the `STOU` command (unique, non-overwriting upload) your path io
+must set :py:attr:`aioftp.AbstractPathIO.supports_unique_file` to `True` and
+implement :py:meth:`aioftp.AbstractPathIO.open_unique`, which atomically
+creates a new unique file. The file name must be reserved by the creation
+syscall itself (e.g. `O_CREAT | O_EXCL`), do not check
+:py:meth:`aioftp.AbstractPathIO.exists` first, since that introduces a race
+condition.
+
 User Manager
 ------------
 

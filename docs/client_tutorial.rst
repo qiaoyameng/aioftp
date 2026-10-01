@@ -263,6 +263,29 @@ work with streams is:
     ...     async for block in stream.iter_by_block():
     ...         # do something with data
 
+Unique upload (STOU)
+--------------------
+
+If multiple clients (or multiple connections) upload the same filename, then
+:py:meth:`aioftp.Client.upload_stream` overwrites the file. Use
+:py:meth:`aioftp.Client.upload_unique` (or low-level
+:py:meth:`aioftp.Client.stou_stream`) to atomically create a unique file, so
+nobody overwrites each other. The server returns the actual path of the
+created file:
+
+::
+
+    >>> path = await client.upload_unique("local.txt", "remote.txt")
+    >>> path
+    PurePosixPath('/remote.txt')
+    >>> await client.upload_unique("local.txt", "remote.txt")
+    PurePosixPath('/remote.txt.1607686991453211234.1')
+
+The second argument is a name hint: directory or name. Empty argument means
+current directory. If the transfer fails with a disk error, the file is left
+on the server (possibly partially written); if the unique file can not be
+created, nothing is left.
+
 Or, if you want to abort transfer at some point
 
 ::

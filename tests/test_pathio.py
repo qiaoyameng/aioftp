@@ -1,4 +1,5 @@
 import contextlib
+import pathlib
 
 import pytest
 
@@ -306,3 +307,96 @@ async def test_rename_over_exists(path_io, temp_dir):
     await path_io.mkdir(source)
     await path_io.mkdir(destination)
     await path_io.rename(source, destination)
+
+
+def test_open_unique_capability(path_io):
+    assert path_io.supports_unique_file is True
+
+
+@pytest.mark.asyncio
+async def test_open_unique_creates_file(path_io, temp_dir):
+    context, path = await path_io.open_unique(temp_dir / "foo")
+    async with context as file_out:
+        await file_out.write(b"first")
+    assert await path_io.is_file(path)
+
+
+@pytest.mark.asyncio
+async def test_open_unique_does_not_overwrite(path_io, temp_dir):
+    context, first = await path_io.open_unique(temp_dir / "foo")
+    async with context as file_out:
+        await file_out.write(b"first")
+    context, second = await path_io.open_unique(temp_dir / "foo")
+    assert second != first
+    async with context as file_out:
+        await file_out.write(b"second")
+    async with path_io.open(first, mode="rb") as file_in:
+        assert await file_in.read() == b"first"
+    async with path_io.open(second, mode="rb") as file_in:
+        assert await file_in.read() == b"second"
+
+
+@pytest.mark.asyncio
+async def test_open_unique_parent_not_exist(path_io, temp_dir):
+    with universal_exception_reason(FileNotFoundError):
+        await path_io.open_unique(temp_dir / "missing" / "foo")
+
+
+def test_open_unique_default_not_implemented():
+    assert aioftp.AbstractPathIO.supports_unique_file is False
+
+    class DummyPathIO(aioftp.AbstractPathIO):
+        async def exists(self, path):
+            return False
+
+        async def is_dir(self, path):
+            return False
+
+        async def is_file(self, path):
+            return False
+
+        async def mkdir(self, path, *, parents=False, exist_ok=False):
+            pass
+
+        async def rmdir(self, path):
+            pass
+
+        async def unlink(self, path):
+            pass
+
+        def list(self, path):
+            raise NotImplementedError
+
+        async def stat(self, path):
+            raise NotImplementedError
+
+        async def _open(self, path, mode="rb"):
+            raise NotImplementedError
+
+        async def seek(self, file, offset, whence=0):
+            raise NotImplementedError
+
+        async def write(self, file, data):
+            raise NotImplementedError
+
+        async def read(self, file, block_size=-1):
+            raise NotImplementedError
+
+        async def close(self, file):
+            pass
+
+        async def rename(self, source, destination):
+            raise NotImplementedError
+
+    import asyncio
+
+    with pytest.raises(NotImplementedError):
+        asyncio.run(DummyPathIO().open_unique(pathlib.Path("/foo")))
+
+
+@pytest.mark.asyncio
+async def test_open_unique_empty_name(path_io, temp_dir):
+    context, path = await path_io.open_unique(temp_dir / "")
+    async with context as file_out:
+        await file_out.write(b"x")
+    assert await path_io.is_file(path)

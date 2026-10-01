@@ -3,6 +3,7 @@ import asyncio
 import functools
 import io
 import operator
+import os
 import stat
 import sys
 import time
@@ -58,6 +59,7 @@ PathIOType = TypeVar("PathIOType", bound="AbstractPathIO[Any]")
 class _OpenKwargs(TypedDict, total=False):
     path: Path
     mode: str
+    file: io.IOBase
 
 
 class AsyncPathIOContext:
@@ -81,18 +83,22 @@ class AsyncPathIOContext:
 
     """
 
-    def __init__(self, pathio: PathIOType, args: tuple[Any], kwargs: _OpenKwargs) -> None:
+    def __init__(self, pathio: PathIOType, args: tuple[Any, ...], kwargs: _OpenKwargs) -> None:
         self.close: Callable[..., Awaitable[None]] | None = None
         self.pathio = pathio
         self.args = args
         self.kwargs = kwargs
+        self.file: io.BytesIO | None = kwargs.get("file")  # type: ignore[assignment]
 
     async def __aenter__(self) -> Self:
-        self.file = await self.pathio._open(*self.args, **self.kwargs)
-        self.seek = functools.partial(self.pathio.seek, self.file)
-        self.write = functools.partial(self.pathio.write, self.file)
-        self.read = functools.partial(self.pathio.read, self.file)
-        self.close = functools.partial(self.pathio.close, self.file)
+        if self.file is None:
+            open_kwargs = {k: v for k, v in self.kwargs.items() if k != "file"}
+            self.file = await self.pathio._open(*self.args, **open_kwargs)  # type: ignore[arg-type]
+        file = self.file
+        self.seek = functools.partial(self.pathio.seek, file)
+        self.write = functools.partial(self.pathio.write, file)
+        self.read = functools.partial(self.pathio.read, file)
+        self.close = functools.partial(self.pathio.close, file)
 
         return self
 
@@ -218,6 +224,21 @@ class PathlibOpenKwargs(TypedDict, total=False):
 
 
 PathType = TypeVar("PathType", bound=PurePath)
+
+
+def _fs_open_unique(path: Path) -> tuple[io.IOBase, Path]:
+    if not path.name:
+        path = path / "file"
+    candidates = (path,) + tuple(
+        path.with_name(f"{path.name}.{time.time_ns()}.{counter}") for counter in range(1, 1000)
+    )
+    for candidate in candidates:
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            continue
+        return os.fdopen(fd, "wb"), candidate
+    raise OSError("can not find unique name")
 
 
 class AbstractPathIO(Generic[PathType], abc.ABC):
@@ -405,6 +426,33 @@ class AbstractPathIO(Generic[PathType], abc.ABC):
         """
         return AsyncPathIOContext(self, args, kwargs)
 
+    supports_unique_file: bool = False
+    """
+    Declares that this path io supports unique file creation via
+    :py:meth:`aioftp.AbstractPathIO.open_unique`.
+    """
+
+    async def open_unique(self, path: PathType) -> tuple[AsyncPathIOContext, PathType]:
+        """
+        :py:func:`asyncio.coroutine`
+
+        Atomically create a new file with a unique name derived from the
+        `path` name hint in `path` parent directory and open it for writing.
+        Existing files must never be overwritten and the uniqueness must be
+        established atomically (i.e. without a separate
+        :py:meth:`aioftp.AbstractPathIO.exists` check, which would introduce
+        a race condition).
+
+        :param path: path, which name is used as a name hint
+        :type path: :py:class:`pathlib.Path`
+
+        :return: pair of unentered
+            :py:class:`aioftp.pathio.AsyncPathIOContext` and the actual path
+            of the created file
+        :rtype: :py:class:`tuple`
+        """
+        raise NotImplementedError
+
     @universal_exception
     @defend_file_methods
     @abc.abstractmethod
@@ -488,6 +536,8 @@ class PathIO(AbstractPathIO[Path]):
     """
     Blocking path io. Directly based on :py:class:`pathlib.Path` methods.
     """
+
+    supports_unique_file = True
 
     @universal_exception
     async def exists(self, path: Path) -> bool:
@@ -579,6 +629,11 @@ class PathIO(AbstractPathIO[Path]):
     async def rename(self, source: Path, destination: Path) -> Path:
         return source.rename(destination)
 
+    @universal_exception
+    async def open_unique(self, path: Path) -> tuple[AsyncPathIOContext, Path]:  # type: ignore[override]
+        file, unique_path = _fs_open_unique(path)
+        return AsyncPathIOContext(self, (), {"file": file}), unique_path
+
 
 class HasExecutor(Protocol):
     executor: Executor | None
@@ -617,6 +672,8 @@ class AsyncPathIO(AbstractPathIO[Path]):
     :param executor: executor for running blocking tasks
     :type executor: :py:class:`concurrent.futures.Executor`
     """
+
+    supports_unique_file = True
 
     def __init__(
         self,
@@ -749,6 +806,18 @@ class AsyncPathIO(AbstractPathIO[Path]):
     def rename(self, source: Path, destination: Path) -> Path:
         return source.rename(destination)
 
+    @universal_exception
+    @with_timeout
+    async def open_unique(  # type: ignore[override]
+        self,
+        path: Path,
+    ) -> tuple[AsyncPathIOContext, Path]:
+        file, unique_path = await asyncio.get_running_loop().run_in_executor(
+            self.executor,
+            functools.partial(_fs_open_unique, path),
+        )
+        return AsyncPathIOContext(self, (), {"file": file}), unique_path
+
 
 class Node:
     @overload
@@ -801,6 +870,8 @@ class MemoryPathIO(AbstractPathIO[PurePosixPath]):
     Non-blocking path io. Based on in-memory tree. It is just proof of concept
     and probably not so fast as it can be.
     """
+
+    supports_unique_file = True
 
     class Stats(NamedTuple):
         st_size: int
@@ -1063,3 +1134,26 @@ class MemoryPathIO(AbstractPathIO[PurePosixPath]):
             else:
                 dparent.content.append(snode)
         return destination
+
+    @universal_exception
+    async def open_unique(  # type: ignore[override]
+        self,
+        path: PurePosixPath,
+    ) -> tuple[AsyncPathIOContext, PurePosixPath]:
+        name = path.name or "file"
+        parent = self.get_node(self._absolute(path).parent)
+        if parent is None or not isinstance(parent.content, list):
+            raise FileNotFoundError
+        candidate = path.parent / name if path.name else self._absolute(path).parent / name
+        if self.get_node(candidate) is not None:
+            stamp = time.time_ns()
+            counter = 1
+            while True:
+                candidate = candidate.parent / f"{name}.{stamp}.{counter}"
+                if self.get_node(candidate) is None:
+                    break
+                counter += 1
+        content = io.BytesIO()
+        new_node = Node("file", candidate.name, content=content)
+        parent.content.append(new_node)
+        return AsyncPathIOContext(self, (), {"file": content}), candidate

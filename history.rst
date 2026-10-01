@@ -1,3 +1,7 @@
+0.28.4 (2026-10-01)
+-------------------
+- add `STOU` support: server atomically creates a unique file via new `PathIO.open_unique`/`supports_unique_file` api; client `stou_stream` and `upload_unique` return the actual created path
+
 0.28.3 (2026-09-19)
 -------------------
 - client `is_dir` should treat `cdir` and `pdir` as a directory too, according to RFC3659 (fixes #211)

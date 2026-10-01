@@ -97,12 +97,17 @@ class DataConnectionThrottleStreamIO(ThrottleStreamIO):
             write_timeout=write_timeout,
         )
         self.client = client
+        self.server_path: PurePosixPath | None = None
+        """
+        Actual server side path, which the transfer was made to. Set for
+        unique (STOU) upload streams, :py:class:`None` otherwise.
+        """
 
     async def finish(
         self,
         expected_codes: str | tuple[str, ...] = "2xx",
         wait_codes: str | tuple[str, ...] = "1xx",
-    ) -> None:
+    ) -> tuple[Code, list[str]]:
         """
         :py:func:`asyncio.coroutine`
 
@@ -116,9 +121,12 @@ class DataConnectionThrottleStreamIO(ThrottleStreamIO):
         :param wait_codes: tuple of wait codes or wait code
         :type wait_codes: :py:class:`tuple` of :py:class:`str` or
             :py:class:`str`
+
+        :return: final response code and info lines
+        :rtype: :py:class:`tuple`
         """
         self.close()
-        await self.client.command(None, expected_codes, wait_codes)
+        return await self.client.command(None, expected_codes, wait_codes)
 
     async def __aexit__(
         self,
@@ -465,6 +473,22 @@ class BaseClient:
                         directory += '"'
                     directory += ch
         return PurePosixPath(directory)
+
+    @staticmethod
+    def parse_stou_response(s: str) -> PurePosixPath:
+        """
+        Parsing `STOU` server response. The actual pathname of the created
+        unique file is expected to be the last token in the info line, as in
+        "FILE: /path/to/file".
+
+        :param s: response line
+        :type s: :py:class:`str`
+
+        :return: actual path of the created file
+        :rtype: :py:class:`pathlib.PurePosixPath`
+        """
+        _, _, path = s.strip().partition(":")
+        return PurePosixPath(path.strip().strip('"'))
 
     @staticmethod
     def parse_unix_mode(s: str) -> int:
@@ -1170,6 +1194,25 @@ class Client(BaseClient):
             offset=offset,
         )
 
+    def stou_stream(
+        self,
+        destination: PathLike = "",
+    ) -> AsyncEnterableInstanceProtocol[DataConnectionThrottleStreamIO]:
+        """
+        Create stream for unique write (STOU) to `destination` name hint.
+        The server atomically creates a new unique file, which never
+        overwrites existing files. The actual path is available after the
+        stream enters via `stream.server_path`.
+
+        :param destination: destination directory or name hint on server
+            side
+        :type destination: :py:class:`str` or :py:class:`pathlib.PurePosixPath`
+
+        :rtype: :py:class:`aioftp.DataConnectionThrottleStreamIO`
+        """
+        command = "STOU" if destination == "" else "STOU " + str(destination)
+        return self.get_stream(command, "1xx")
+
     async def upload(
         self,
         source: str | Path,
@@ -1229,6 +1272,43 @@ class Client(BaseClient):
                             write_into=True,
                             block_size=block_size,
                         )
+
+    async def upload_unique(
+        self,
+        source: str | Path,
+        destination: PathLike = "",
+        *,
+        block_size: int = DEFAULT_BLOCK_SIZE,
+    ) -> PurePosixPath:
+        """
+        :py:func:`asyncio.coroutine`
+
+        Upload file using unique file name (`STOU`). The server atomically
+        creates a new unique file, so concurrent uploads with the same name
+        hint never overwrite each other.
+
+        :param source: source path of file on client side
+        :type source: :py:class:`str` or :py:class:`pathlib.Path`
+
+        :param destination: destination directory or name hint on server
+            side; empty means current directory
+        :type destination: :py:class:`str` or :py:class:`pathlib.PurePosixPath`
+
+        :param block_size: block size for transaction
+        :type block_size: :py:class:`int`
+
+        :return: the actual path of the created file on server side
+        :rtype: :py:class:`pathlib.PurePosixPath`
+        """
+        source = Path(source)
+        if not await self.path_io.is_file(source):
+            raise ValueError("upload_unique supports file upload only")
+        name_hint = destination or PurePosixPath(source.name)
+        async with self.path_io.open(source, mode="rb") as file_in, self.stou_stream(name_hint) as stream:
+            async for block in file_in.iter_by_block(block_size):
+                await stream.write(block)
+            server_path = stream.server_path
+        return server_path  # type: ignore[return-value]
 
     def download_stream(
         self,
@@ -1405,7 +1485,7 @@ class Client(BaseClient):
         reader, writer = await self.get_passive_connection(conn_type)
         if offset:
             await self.command("REST " + str(offset), "350")
-        await self.command(command, expected_codes, wait_codes, censor_after)
+        code, info = await self.command(command, expected_codes, wait_codes, censor_after)
         stream = DataConnectionThrottleStreamIO(
             self,
             reader,
@@ -1413,6 +1493,8 @@ class Client(BaseClient):
             throttles={"_": self.throttle},
             timeout=self.socket_timeout,
         )
+        if command is not None and command.split(maxsplit=1)[0].upper() == "STOU" and info:
+            stream.server_path = self.parse_stou_response(info[-1])
         return stream
 
     async def abort(self, *, wait: bool = True) -> None:

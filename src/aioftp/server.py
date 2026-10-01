@@ -765,6 +765,7 @@ class Server:
             "rnfr": self.rnfr,
             "rnto": self.rnto,
             "stor": self.stor,
+            "stou": self.stou,
             "syst": self.syst,
             "type": self.type,
             "user": self.user,
@@ -1034,7 +1035,7 @@ class Server:
                             pending.add(
                                 asyncio.create_task(f(connection, rest)),  # type: ignore[arg-type]
                             )
-                            if cmd not in ("retr", "stor", "appe"):
+                            if cmd not in ("retr", "stor", "stou", "appe"):
                                 connection.restart_offset = 0
                         else:
                             message = f"{cmd!r} not implemented"
@@ -1610,6 +1611,77 @@ class Server:
 
     async def appe(self, connection: Connection, rest: str | PurePosixPath) -> bool:
         return await self.stor(connection, rest, "ab")
+
+    @ConnectionConditions(
+        ConnectionConditions.login_required,
+        ConnectionConditions.passive_server_started,
+    )
+    async def stou(self, connection: Connection, rest: str | PurePosixPath) -> bool:
+        if not connection.path_io.supports_unique_file:
+            connection.response("502", "STOU not implemented for this path io")
+            return True
+
+        hint = PurePosixPath(rest) if rest else PurePosixPath()
+        if hint.name:
+            name_hint = hint.name
+            directory = hint.parent
+        else:
+            name_hint = None
+            directory = hint
+        real_directory, virtual_directory = self.get_paths(connection, directory)
+
+        permission = await connection.user.get_permissions(virtual_directory)
+        if not permission.writable:
+            connection.response("550", "permission denied")
+            return True
+
+        if not await connection.path_io.is_dir(real_directory):
+            connection.response("550", "path unreachable")
+            return True
+
+        if not connection.future.data_connection.done():
+            connection.response("425", "Can't open data connection")
+            return True
+
+        if name_hint is None:
+            hint_path = real_directory
+        else:
+            hint_path = real_directory / name_hint
+        file_out, unique_real_path = await connection.path_io.open_unique(hint_path)
+
+        base_path = connection.user.base_path
+        try:
+            relative = unique_real_path.relative_to(base_path)
+        except ValueError:
+            virtual_path = PurePosixPath(unique_real_path)
+        else:
+            virtual_path = PurePosixPath("/") / PurePosixPath(relative)
+
+        @ConnectionConditions(
+            ConnectionConditions.data_connection_made,
+            wait=True,
+            fail_code="425",
+            fail_info="Can't open data connection",
+        )
+        @worker
+        async def stou_worker(
+            self: "Server",
+            connection: Connection,
+            rest: str | PurePosixPath,
+        ) -> bool:
+            stream = connection.data_connection
+            del connection.data_connection
+            async with file_out, stream:
+                async for data in stream.iter_by_block(connection.block_size):
+                    await file_out.write(data)
+            connection.response("226", f"FILE: {virtual_path}")
+            return True
+
+        coro = stou_worker(self, connection, rest)
+        task: asyncio.Task[bool] = asyncio.create_task(coro)  # type: ignore[arg-type]
+        connection.extra_workers.add(task)
+        connection.response("150", f"FILE: {virtual_path}")
+        return True
 
     async def rest(self, connection: Connection, rest: str) -> bool:
         if rest.isdigit():
